@@ -1,0 +1,15 @@
+# Зависимости для скриптов загрузки видео
+
+# Для YouTube
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# Для VK
+vk-api>=11.9.9
+
+# Для мониторинга файлов
+watchdog>=3.0.0
+
+# Общие зависимости
+requests>=2.31.0
