@@ -13,3 +13,6 @@ watchdog>=3.0.0
 
 # Общие зависимости
 requests>=2.31.0
+Pyrogram
+google-generativeai
+dotenv

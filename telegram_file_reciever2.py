@@ -11,14 +11,9 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import asyncio
 import PyPDF2
-import google.generativeai as genai
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-import pickle
-from glob import glob
 from config_en import CONFIG
+from common.gemini_client import GeminiContentGenerator
+from common.youtube_uploader import YouTubeUploader
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,189 +29,26 @@ logging.basicConfig(
 # GEMINI GENERATOR
 # =============================================================================
 
-class GeminiGenerator:
-    def __init__(self):
-        genai.configure(api_key=CONFIG['gemini']['api_key'])
-        self.model = genai.GenerativeModel(CONFIG['gemini']['model'])
-        logging.info("✅ Gemini API инициализирован")
-    
-    def generate_description(self, title, content):
-        """Генерация описания через Gemini"""
-        if len(content) > 5000:
-            content = content[:5000] + "..."
-        
-        prompt = f"""
-You're an expert at creating YouTube video descriptions.
-
-DOCUMENT TITLE: {title}
-DOCUMENT CONTENTS: {content}
-
-Create a short, engaging YouTube description:
-- 3-5 sentences (max 300 characters)
-- Start with a compelling question or fact
-- Simple language, 2-3 emojis
-- NO academic language
-- Return ONLY the description text
-
-Example: "Is AI about to change how we know what we know? 🧠✨ This paper explores how we can build AI systems that we can truly trust. Discover the key principles of epistemic reliability! 🤖📚"
-
-Description:
-"""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            logging.error(f"❌ Gemini error: {e}")
-            return f"Overview: {title}"
-
-gemini_gen = GeminiGenerator()
+gemini_gen = GeminiContentGenerator(CONFIG['gemini']['api_key'], CONFIG['gemini']['model'])
 
 # =============================================================================
 # YOUTUBE UPLOADER
 # =============================================================================
 
-class YouTubeUploader:
-    SCOPES = [
-        'https://www.googleapis.com/auth/youtube.upload',
-        'https://www.googleapis.com/auth/youtube',
-        'https://www.googleapis.com/auth/youtube.force-ssl',
-    ]
-    
-    def __init__(self, client_secrets_file):
-        self.client_secrets_file = client_secrets_file
-        self.credentials = None
-        self.youtube = None
-        self._authenticate()
-    
-    def _authenticate(self):
-        """Аутентификация в YouTube API"""
-        creds = None
-        token_file = 'youtube_token_en.pickle'
-        
-        if os.path.exists(token_file):
-            with open(token_file, 'rb') as token:
-                creds = pickle.load(token)
-            logging.info("YouTube: Загружены credentials")
-        
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                logging.info("YouTube: Обновление токена...")
-                creds.refresh(Request())
-            else:
-                logging.info("YouTube: Требуется авторизация...")
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.client_secrets_file, 
-                    self.SCOPES,
-                    redirect_uri='http://localhost:8080/'
-                )
-                creds = flow.run_local_server(port=8080)
-                logging.info("YouTube: Авторизация успешна")
-            
-            with open(token_file, 'wb') as token:
-                pickle.dump(creds, token)
-        
-        self.credentials = creds
-        self.youtube = build('youtube', 'v3', credentials=creds)
-        logging.info("✅ YouTube API готов")
-    
-    def upload_video(self, video_path, title, description, tags=None, thumbnail_path=None, playlist_id=None):
-        """Загрузка видео на YouTube"""
-        try:
-            logging.info(f"YouTube: Начинаем загрузку '{title}'")
-            
-            body = {
-                'snippet': {
-                    'title': title,
-                    'description': description,
-                    'tags': tags or [],
-                    'categoryId': CONFIG['youtube']['category_id']
-                },
-                'status': {
-                    'privacyStatus': CONFIG['youtube']['privacy_status'],
-                    'selfDeclaredMadeForKids': False,
-                }
-            }
-            
-            media = MediaFileUpload(
-                video_path,
-                chunksize=-1,
-                resumable=True,
-                mimetype='video/*'
-            )
-            
-            request = self.youtube.videos().insert(
-                part=','.join(body.keys()),
-                body=body,
-                media_body=media
-            )
-            
-            response = None
-            while response is None:
-                status, response = request.next_chunk()
-                if status:
-                    progress = int(status.progress() * 100)
-                    logging.info(f"YouTube: Загружено {progress}%")
-            
-            video_id = response['id']
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            # Задержка перед thumbnail
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                logging.info("⏳ Ждём 3 сек перед загрузкой thumbnail...")
-                import time
-                time.sleep(3)
-                self._upload_thumbnail(video_id, thumbnail_path)
-            
-            # Добавление в плейлист
-            if playlist_id:
-                self._add_to_playlist(video_id, playlist_id)
-            
-            logging.info(f"✅ YouTube: Видео загружено - {video_url}")
-            return {'success': True, 'video_id': video_id, 'url': video_url}
-            
-        except Exception as e:
-            logging.error(f"❌ YouTube: Ошибка - {str(e)}")
-            return {'success': False, 'error': str(e)}
-    
-    def _upload_thumbnail(self, video_id, thumbnail_path):
-        """Загрузка миниатюры"""
-        try:
-            logging.info(f"📸 Загрузка thumbnail: {os.path.basename(thumbnail_path)}")
-            self.youtube.thumbnails().set(
-                videoId=video_id,
-                media_body=MediaFileUpload(thumbnail_path)
-            ).execute()
-            logging.info("✅ Thumbnail загружен")
-        except Exception as e:
-            logging.error(f"❌ Ошибка thumbnail: {e}")
-    
-    def _add_to_playlist(self, video_id, playlist_id):
-        """Добавление в плейлист"""
-        try:
-            logging.info(f"📋 Добавление в плейлист: {playlist_id}")
-            self.youtube.playlistItems().insert(
-                part="snippet",
-                body={
-                    'snippet': {
-                        'playlistId': playlist_id,
-                        'resourceId': {
-                            'kind': 'youtube#video',
-                            'videoId': video_id
-                        }
-                    }
-                }
-            ).execute()
-            logging.info("✅ Добавлено в плейлист")
-        except Exception as e:
-            logging.error(f"❌ Ошибка плейлиста: {e}")
-
 # Инициализация YouTube uploader (если включено)
 youtube_uploader = None
+youtube_init_error = None
 if CONFIG['youtube']['auto_upload'] and os.path.exists(CONFIG['youtube']['client_secrets_file']):
     try:
-        youtube_uploader = YouTubeUploader(CONFIG['youtube']['client_secrets_file'])
+        youtube_uploader = YouTubeUploader(
+            CONFIG['youtube']['client_secrets_file'],
+            token_file='youtube_token_en.pickle',
+            oauth_ports=(8080, 8081),
+            category_id=CONFIG['youtube']['category_id'],
+            privacy_status=CONFIG['youtube']['privacy_status'],
+        )
     except Exception as e:
+        youtube_init_error = str(e)
         logging.warning(f"⚠️  YouTube uploader не инициализирован: {e}")
 
 # =============================================================================
@@ -230,8 +62,18 @@ app = Client(
     phone_number=CONFIG['phone_number']
 )
 
-# Хранилище для состояния пользователей (ожидание ввода)
 user_states = {}
+pending_video_metadata_by_user = {}
+
+# Фильтр — только личный чат с владельцем
+OWNER_ID = 8591956842
+owner_filter = filters.create(lambda _, __, m: (
+    m is not None
+    and m.from_user is not None
+    and m.from_user.id == OWNER_ID
+    and m.chat is not None
+    and m.chat.id == OWNER_ID  # личный чат: chat_id == user_id
+))
 
 # =============================================================================
 # УТИЛИТЫ
@@ -241,6 +83,12 @@ def is_allowed_user(user_id: int) -> bool:
     if not CONFIG['allowed_users']:
         return True
     return user_id in CONFIG['allowed_users']
+
+def extract_user_id(message: Message):
+    """Безопасно достаёт user_id; для сервисных/канальных сообщений вернёт None."""
+    if not message or not message.from_user:
+        return None
+    return message.from_user.id
 
 def is_video_file(filename: str) -> bool:
     ext = os.path.splitext(filename)[1].lower()
@@ -292,13 +140,36 @@ def read_document(file_path):
         return read_text(file_path)
     return "", ""
 
+def cleanup_stale_metadata_json(current_base_name: str):
+    """Удаляет старые metadata.json, чтобы исключить путаницу между публикациями."""
+    folder = CONFIG['download_folder']
+    if not os.path.exists(folder):
+        return
+
+    removed = 0
+    current_json_name = f"{current_base_name}.json"
+    for name in os.listdir(folder):
+        if not name.lower().endswith('.json'):
+            continue
+        if name == current_json_name:
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            os.remove(path)
+            removed += 1
+
+    if removed:
+        logging.info(f"🧹 Удалено старых metadata.json: {removed}")
+
 # =============================================================================
 # КОМАНДЫ
 # =============================================================================
 
-@app.on_message(filters.command("start"))
+@app.on_message(owner_filter & filters.command("start"))
 async def start_command(client, message: Message):
-    user_id = message.from_user.id
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     
     if not is_allowed_user(user_id):
         await message.reply_text(f"❌ Доступ запрещён.\nВаш ID: `{user_id}`")
@@ -315,8 +186,11 @@ async def start_command(client, message: Message):
         "/stats - Статистика"
     )
 
-@app.on_message(filters.command("help"))
+@app.on_message(owner_filter & filters.command("help"))
 async def help_command(client, message: Message):
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     await message.reply_text(
         "📖 **Инструкция:**\n\n"
         "**Видео (.mp4, .mov, .avi, .mkv):**\n"
@@ -329,11 +203,14 @@ async def help_command(client, message: Message):
         "4. Вы выберете плейлист\n"
         "5. Вы укажете ссылку на источник\n"
         "6. Создастся metadata.json\n\n"
-        f"**Ваш ID:** `{message.from_user.id}`"
+        f"**Ваш ID:** `{user_id}`"
     )
 
-@app.on_message(filters.command("stats"))
+@app.on_message(owner_filter & filters.command("stats"))
 async def stats_command(client, message: Message):
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     folder = CONFIG['download_folder']
     
     if not os.path.exists(folder):
@@ -354,9 +231,11 @@ async def stats_command(client, message: Message):
 # ОБРАБОТЧИК ВИДЕО
 # =============================================================================
 
-@app.on_message(filters.video)
+@app.on_message(owner_filter & filters.video)
 async def handle_video(client, message: Message):
-    user_id = message.from_user.id
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     
     if not is_allowed_user(user_id):
         await message.reply_text(f"❌ Доступ запрещён. ID: `{user_id}`")
@@ -375,24 +254,37 @@ async def handle_video(client, message: Message):
         return
     
     os.makedirs(CONFIG['download_folder'], exist_ok=True)
-    file_path = os.path.join(CONFIG['download_folder'], file_name)
-    
-    file_path_metajson = glob(f"{CONFIG['download_folder']}/*.json")
-    file_name_metajson = None
-    if any(file_path_metajson):
-        file_name_metajson = file_path_metajson[0].split('/')[-1][:-5]
-    else:
-        await message.reply_text(
-            f"❌ Meta data does not exist\n"
-            f"Put file previously"
-        )
-        logging.error(f"Meta data does not exist")
-        return None
+    original_base, ext = os.path.splitext(file_name)
+    exact_json_path = os.path.join(CONFIG['download_folder'], f"{original_base}.json")
 
-    # if os.path.exists(file_path):
-    base, ext = os.path.splitext(file_name)
-    #     file_name = f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
-    file_name = f"{file_name_metajson}{ext}"
+    selected_base = None
+    selection_reason = None
+
+    # 1) Точное совпадение имени видео и json
+    if os.path.exists(exact_json_path):
+        selected_base = original_base
+        selection_reason = "exact"
+    else:
+        # 2) Берём metadata, созданную этим же пользователем последней
+        pending_base = pending_video_metadata_by_user.get(user_id)
+        if pending_base:
+            pending_json_path = os.path.join(CONFIG['download_folder'], f"{pending_base}.json")
+            if os.path.exists(pending_json_path):
+                selected_base = pending_base
+                selection_reason = "pending_user"
+
+    if not selected_base:
+        await message.reply_text(
+            "❌ Metadata для этого видео не найден.\n"
+            f"Искал: `{original_base}.json`\n\n"
+            "Сначала отправьте PDF/TXT и завершите создание metadata,"
+            " затем отправьте видео."
+        )
+        logging.error(f"Metadata mismatch: not found for {original_base}")
+        return
+
+    # Видео сохраняем под именем выбранной metadata
+    file_name = f"{selected_base}{ext}"
     file_path = os.path.join(CONFIG['download_folder'], file_name)
     
     status = await message.reply_text(
@@ -416,10 +308,22 @@ async def handle_video(client, message: Message):
         )
         
         logging.info(f"✅ Video saved: {file_path}")
+        if selection_reason == "pending_user":
+            logging.info(
+                f"🧭 Used metadata from user's latest document {user_id}: {selected_base}.json"
+            )
         
         # АВТОМАТИЧЕСКАЯ ЗАГРУЗКА НА YOUTUBE
         if youtube_uploader and CONFIG['youtube']['auto_upload']:
             await upload_to_youtube_from_telegram(file_path, file_name, message, status)
+        elif CONFIG['youtube']['auto_upload']:
+            reason = youtube_init_error or "uploader не инициализирован"
+            await status.edit_text(
+                f"✅ Видео загружено локально\n\n"
+                f"📄 {file_name}\n"
+                f"⚠️ YouTube отключён: {reason}\n\n"
+                f"Нужна повторная авторизация YouTube."
+            )
         
     except Exception as e:
         await status.edit_text(f"❌ Ошибка: `{e}`")
@@ -506,6 +410,9 @@ async def upload_to_youtube_from_telegram(video_path, video_name, message, statu
             if os.path.exists(json_path):
                 processed_json = os.path.join(CONFIG['processed_folder'], f"{base_name}.json")
                 os.rename(json_path, processed_json)
+
+            # Очищаем оставшиеся metadata.json в download_folder
+            cleanup_stale_metadata_json(base_name)
             
             logging.info(f"✅ YouTube: {video_url}")
         else:
@@ -525,10 +432,11 @@ async def upload_to_youtube_from_telegram(video_path, video_name, message, statu
 # ОБРАБОТЧИК ДОКУМЕНТОВ (PDF/TXT) - С ГЕНЕРАЦИЕЙ METADATA
 # =============================================================================
 
-@app.on_message(filters.document)
+@app.on_message(owner_filter & filters.document)
 async def handle_document(client, message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     
     if not is_allowed_user(user_id):
         await message.reply_text(f"❌ Доступ запрещён. ID: `{user_id}`")
@@ -588,7 +496,7 @@ async def handle_document(client, message: Message):
             )
             
             # Генерируем описание
-            description = gemini_gen.generate_description(title, content)
+            description = gemini_gen.generate_description(title, content, lang="en")
             
             # Сохраняем состояние и НАЧИНАЕМ ДИАЛОГ
             user_states[user_id] = {
@@ -609,11 +517,23 @@ async def handle_document(client, message: Message):
             )
         
         else:
-            # Обычное видео
+            # Видео, отправленное как document
             await status.edit_text(
-                f"✅ Файл загружен!\n\n📄 {file_name}"
+                f"✅ Видео загружено!\n\n📄 {file_name}"
             )
-            logging.info(f"✅ File saved: {file_path}")
+            logging.info(f"✅ Video saved (document): {file_path}")
+
+            # АВТОМАТИЧЕСКАЯ ЗАГРУЗКА НА YOUTUBE
+            if youtube_uploader and CONFIG['youtube']['auto_upload']:
+                await upload_to_youtube_from_telegram(file_path, file_name, message, status)
+            elif CONFIG['youtube']['auto_upload']:
+                reason = youtube_init_error or "uploader не инициализирован"
+                await status.edit_text(
+                    f"✅ Видео загружено локально\n\n"
+                    f"📄 {file_name}\n"
+                    f"⚠️ YouTube отключён: {reason}\n\n"
+                    f"Нужна повторная авторизация YouTube."
+                )
         
     except Exception as e:
         await status.edit_text(f"❌ Ошибка: `{e}`")
@@ -623,9 +543,11 @@ async def handle_document(client, message: Message):
 # ОБРАБОТЧИК ТЕКСТА И ИЗОБРАЖЕНИЙ - ПОСЛЕДОВАТЕЛЬНЫЙ ДИАЛОГ
 # =============================================================================
 
-@app.on_message(filters.text & ~filters.command(["start", "help", "stats"]))
+@app.on_message(owner_filter & filters.text & ~filters.command(["start", "help", "stats"]))
 async def handle_text(client, message: Message):
-    user_id = message.from_user.id
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     
     if not is_allowed_user(user_id):
         return
@@ -703,9 +625,11 @@ async def handle_text(client, message: Message):
 # ОБРАБОТЧИК ИЗОБРАЖЕНИЙ (ШАГ 3: THUMBNAIL)
 # =============================================================================
 
-@app.on_message(filters.photo)
+@app.on_message(owner_filter & filters.photo)
 async def handle_photo(client, message: Message):
-    user_id = message.from_user.id
+    user_id = extract_user_id(message)
+    if user_id is None:
+        return
     
     if not is_allowed_user(user_id):
         return
@@ -800,6 +724,9 @@ async def finalize_metadata(user_id, state, message, use_default_thumbnail=True)
     
     logging.info(f"✅ Metadata created: {json_path}")
     logging.info(f"✅ Document renamed to: {new_doc_path}")
+
+    # Запоминаем, какую metadata ожидаем для следующего видео этого пользователя
+    pending_video_metadata_by_user[user_id] = safe_title
     
     # Очищаем состояние
     del user_states[user_id]

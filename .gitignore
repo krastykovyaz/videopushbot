@@ -1,0 +1,34 @@
+# Secrets & credentials — never commit
+.env
+client_secret*.json
+*.pickle
+*.session
+*.session-journal
+spotify_tokens.json
+
+# Legacy prototypes superseded by bot.py + common/ — contain hardcoded
+# Telegram api_id/api_hash/phone_number and a Gemini API key in plaintext.
+# Kept locally for reference; intentionally excluded from git.
+telegram_file_reciever.py
+youtube_uploader_simple.py
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.python-version
+
+# Logs
+*.log
+upload_log_full.txt
+
+# Generated/runtime data
+workspace/
+uploaded_videos/
+videos_to_upload/
+generated.jpg
+code.json
+youtube_uploads.json
+
+# OS
+.DS_Store

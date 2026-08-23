@@ -1,0 +1,57 @@
+{
+  "comment": "Пример конфигурационного файла. Скопируйте как config.json и заполните своими данными",
+  
+  "youtube": {
+    "client_secrets_file": "client_secret_521669452390-j4s4h535sv21h355aobn0vpa6o6ebl1a.apps.googleusercontent.com.json",
+    "privacy_status": "private",
+    "category_id": "22",
+    "comment": "Категории: 1-Film, 2-Autos, 10-Music, 15-Pets, 17-Sports, 19-Travel, 20-Gaming, 22-People, 23-Comedy, 24-Entertainment, 25-News, 26-Howto, 27-Education, 28-Science, 29-Nonprofits"
+  },
+  
+  "vk": {
+    "access_token": "vk1.a.XXXXXXXXXXXXXXXXXXXXXXX",
+    "group_id": 0,
+    "is_private": 0,
+    "comment": "group_id: 0 для личной страницы, или ID группы без минуса. is_private: 0-публичное, 1-приватное"
+  },
+  
+  "rutube": {
+    "client_id": "your_client_id",
+    "client_secret": "your_client_secret", 
+    "access_token": "your_access_token",
+    "is_hidden": false,
+    "category_id": 24,
+    "comment": "Категории Rutube: 1-Фильмы, 2-Сериалы, 24-Блоги, 25-Развлечения, и т.д."
+  },
+  
+  "spotify": {
+    "api_key": "your_anchor_api_key",
+    "show_id": "your_show_id",
+    "comment": "Для Spotify Podcasters (Anchor). Получите на anchor.fm"
+  },
+  
+  "boosty": {
+    "access_token": "your_boosty_access_token",
+    "blog_name": "krastykovyaz",
+    "price": 0,
+    "teaser": "",
+    "comment": "blog_name - имя блога из URL (boosty.to/blog_name). price: 0-бесплатно, или цена в рублях. teaser - превью для неподписчиков"
+  },
+  
+  "patreon": {
+    "access_token": "your_patreon_access_token",
+    "campaign_id": "your_campaign_id",
+    "tier_ids": [],
+    "is_paid": false,
+    "comment": "tier_ids: [] для всех патронов, или список ID уровней. is_paid: true - только для патронов, false - публично"
+  },
+  
+  "settings": {
+    "watch_folder": "./videos_to_upload",
+    "processed_folder": "./processed_videos",
+    "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".flv"],
+    "max_retries": 3,
+    "retry_delay": 60,
+    "comment": "retry_delay в секундах"
+  }
+}

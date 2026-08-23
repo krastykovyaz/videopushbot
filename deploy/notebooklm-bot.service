@@ -1,0 +1,19 @@
+[Unit]
+Description=NotebookLM-clone Telegram bot (PDF -> video -> YouTube/VK)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these three paths/user for your server:
+User=YOUR_LINUX_USER
+WorkingDirectory=/path/to/video_posting
+ExecStart=/path/to/video_posting/venv/bin/python3 bot.py
+
+Restart=on-failure
+RestartSec=10
+
+# bot.py loads its own .env via python-dotenv, so no Environment= lines needed here.
+
+[Install]
+WantedBy=multi-user.target
