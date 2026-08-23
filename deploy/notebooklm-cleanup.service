@@ -1,0 +1,13 @@
+[Unit]
+Description=Disk housekeeping for the NotebookLM bot (workspace/logs retention + Docker prune)
+
+[Service]
+Type=oneshot
+# EDIT these two paths for your server (match notebooklm-bot.service):
+User=YOUR_LINUX_USER
+WorkingDirectory=/path/to/video_posting
+ExecStart=/path/to/video_posting/venv/bin/python3 cleanup.py
+# Docker isn't used by this project itself, but prunes any unused
+# images/containers/build cache system-wide if Docker happens to be
+# installed on the same small server. No-ops harmlessly if it isn't.
+ExecStartPost=-/bin/sh -c 'command -v docker >/dev/null && docker system prune -af --volumes || true'
