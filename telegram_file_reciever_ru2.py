@@ -49,7 +49,7 @@ if CONFIG['youtube']['auto_upload'] and os.path.exists(CONFIG['youtube']['client
         youtube_uploader = YouTubeUploader(
             CONFIG['youtube']['client_secrets_file'],
             token_file='youtube_token_ru.pickle',
-            oauth_ports=(8082, 8083, 8084),
+            oauth_ports=(8080, 8081),
             category_id=CONFIG['youtube']['category_id'],
             privacy_status=CONFIG['youtube']['privacy_status'],
         )

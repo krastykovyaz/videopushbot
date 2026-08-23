@@ -144,7 +144,7 @@ def init_uploaders(dry_run: bool):
         yt_ru = YouTubeUploader(
             config_ru2.CONFIG["youtube"]["client_secrets_file"],
             token_file="youtube_token_ru.pickle",
-            oauth_ports=(8082, 8083, 8084),
+            oauth_ports=(8080, 8081),
             category_id=config_ru2.CONFIG["youtube"]["category_id"],
             privacy_status=config_ru2.CONFIG["youtube"]["privacy_status"],
         )
