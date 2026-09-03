@@ -97,8 +97,28 @@ if config_ru2.CONFIG.get("vk", {}).get("access_token"):
 
 
 # ── Хелперы ─────────────────────────────────────────────────────────────────
-async def progress(chat_id: int, text: str):
-    await client.send_message(chat_id, text)
+def make_progress_tracker(chat_id: int):
+    """
+    Returns a progress_fn bound to one job: the first call sends a status
+    message, every call after that edits the SAME message in place instead
+    of sending a new one — so a 6-step pipeline run produces one message
+    that updates live, not a dozen separate lines in the chat.
+    """
+    state = {"message_id": None}
+
+    async def progress(_chat_id: int, text: str):
+        if state["message_id"] is None:
+            msg = await client.send_message(chat_id, text)
+            state["message_id"] = msg.id
+            return
+        try:
+            await client.edit_message(chat_id, state["message_id"], text)
+        except Exception as e:
+            log.warning(f"progress edit failed ({e}), sending a new message instead")
+            msg = await client.send_message(chat_id, text)
+            state["message_id"] = msg.id
+
+    return progress
 
 
 def is_allowed(user_id: int) -> bool:
@@ -259,7 +279,7 @@ async def _enqueue_langs(event, user_id: int, pdf_path: Path, job_dir: Path, lan
             pdf_path=lang_pdf,
             job_dir=lang_dir,
             lang=lang,
-            progress_fn=progress,
+            progress_fn=make_progress_tracker(event.chat_id),
         )
         await job_queue.enqueue(job)
 
