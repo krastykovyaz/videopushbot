@@ -142,8 +142,11 @@ def _synthesize_sync(text: str, speaker: str, out_path: Path, lang: str):
             raise RuntimeError(f"Edge TTS создал пустой файл: {out_path}")
         log.info(f"Edge TTS OK [{lang}/{speaker}]: {out_path.name}")
     except Exception as e:
-        log.warning(f"Edge TTS ошибка [{lang}/{speaker}]: {e}, фоллбэк на pyttsx3")
-        _synthesize_pyttsx3(text, speaker, out_path, lang)
+        log.warning(f"Edge TTS ошибка [{lang}/{speaker}]: {e}, фоллбэк...")
+        if _synthesize_espeak_ng_cli(text, speaker, out_path, lang):
+            log.info(f"espeak-ng CLI OK [{lang}/{speaker}]: {out_path.name}")
+        else:
+            _synthesize_pyttsx3(text, speaker, out_path, lang)
 
 
 # ── Edge TTS (RU + EN) ────────────────────────────────────────────────────────
@@ -202,10 +205,45 @@ def _synthesize_chatterbox(text: str, speaker: str, out_path: Path):
             return
         except Exception as e:
             log.warning(f"Chatterbox ошибка: {e}")
-    _synthesize_pyttsx3(text, speaker, out_path, lang="en")
+    if not _synthesize_espeak_ng_cli(text, speaker, out_path, lang="en"):
+        _synthesize_pyttsx3(text, speaker, out_path, lang="en")
 
 
-# ── pyttsx3 (финальный фоллбэк, всегда работает) ─────────────────────────────
+# ── espeak-ng CLI (более надёжный фоллбэк на Linux) ──────────────────────────
+
+def _synthesize_espeak_ng_cli(text: str, speaker: str, out_path: Path, lang: str = "ru") -> bool:
+    """
+    Синтезирует через сам бинарник espeak-ng, в обход pyttsx3/ctypes.
+    pyttsx3's espeak-driver написан под классический espeak и на Linux
+    иногда падает с "SetVoiceByName failed with unknown return code -1"
+    из-за несовпадения именования голосов с espeak-ng (напр. "gmw/en").
+    Прямой вызов CLI этой проблемы не имеет.
+    Возвращает True при успехе, False — если espeak-ng не установлен или
+    вызов не удался (тогда вызывающий код падает обратно на pyttsx3).
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("espeak-ng"):
+        return False
+
+    voice = "ru" if lang == "ru" else "en-us"
+    variant = "m3" if speaker == "host1" else "f3"
+    try:
+        subprocess.run(
+            ["espeak-ng", "-v", f"{voice}+{variant}", "-s", "155", "-w", str(out_path), text],
+            check=True, capture_output=True, timeout=120,
+        )
+        return out_path.exists() and out_path.stat().st_size > 1000
+    except subprocess.CalledProcessError as e:
+        log.warning(f"espeak-ng CLI ошибка: {e.stderr.decode(errors='replace')[:200]}")
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning("espeak-ng CLI: таймаут")
+        return False
+
+
+# ── pyttsx3 (финальный фоллбэк) ───────────────────────────────────────────────
 
 def _synthesize_pyttsx3(text: str, speaker: str, out_path: Path, lang: str = "ru"):
     try:
@@ -224,7 +262,12 @@ def _synthesize_pyttsx3(text: str, speaker: str, out_path: Path, lang: str = "ru
             idx = 0 if speaker == "host1" else min(1, len(voices)-1)
             selected = voices[idx]
         if selected:
-            engine.setProperty("voice", selected.id)
+            try:
+                engine.setProperty("voice", selected.id)
+            except Exception as e:
+                # Не даём сбою выбора голоса убить весь сегмент — синтезируем
+                # голосом по умолчанию движка, лучше так, чем ничего.
+                log.warning(f"pyttsx3: не удалось выбрать голос {selected.id!r} ({e}), использую голос по умолчанию")
         engine.setProperty("rate", 155)
         engine.save_to_file(text, str(out_path))
         engine.runAndWait()
