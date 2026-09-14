@@ -19,6 +19,7 @@ import config_ru2
 from common.gemini_client import GeminiContentGenerator
 from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
+from common.pdf_source import download_pdf, is_suitable_pdf_url
 from common.vk_uploader import VKUploader
 from common.youtube_uploader import YouTubeUploader
 from pipeline.step01_extract import extract_pdf
@@ -33,6 +34,13 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 # ── Конфиг ──────────────────────────────────────────────────────────────────
+OWNER_ID = 8591956842
+# Companion channels posting the SAME daily papers in different languages —
+# each triggers generation of ONLY its own language (not both), since they
+# cover the same paper and would otherwise duplicate every upload.
+ARXIV_CHANNEL_EN = "arxivpaper"
+ARXIV_CHANNEL_RU = "arxivpaperu"
+
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
@@ -129,7 +137,7 @@ def is_allowed(user_id: int) -> bool:
 
 
 # ── Обработчик входящих сообщений ───────────────────────────────────────────
-@client.on(events.NewMessage(incoming=True, from_users=[8591956842]))
+@client.on(events.NewMessage(incoming=True, from_users=[OWNER_ID]))
 async def handle_message(event):
     sender  = await event.get_sender()
     user_id = sender.id
@@ -142,6 +150,8 @@ async def handle_message(event):
     if event.text and event.text.strip() in ("/start", "/help"):
         await event.reply(
             "👋 Привет! Просто отправь PDF-файл статьи.\n\n"
+            f"Также слежу за @{ARXIV_CHANNEL_EN} (EN) и @{ARXIV_CHANNEL_RU} (RU) — "
+            "новый пост там сам скачивает PDF и запускает генерацию на своём языке.\n\n"
             "Дальше всё автоматически:\n"
             "🏷 Определяю тему\n"
             "🌍 Авто-детейлинг → только RU (VK+YouTube-RU); остальное → RU+EN\n"
@@ -236,29 +246,82 @@ async def handle_message(event):
         pdf_path = job_dir / "input.pdf"
         await client.download_media(event.document, file=str(pdf_path))
 
-        await event.reply("🔎 Определяю тему и куда публиковать...")
-        blocks = await asyncio.to_thread(extract_pdf, pdf_path, job_dir / "sample")
-        sample_text = "\n\n".join(b["text"] for b in blocks[:5])
-        category = gemini_ru.classify_topic(
-            pdf_path.stem, sample_text, list(config_ru2.CONFIG["playlists"].keys()))
-        if not category:
-            category = "Other"
-            log.warning(f"job {job_id}: classification failed, category='Other'")
-
-        langs = ["ru"] if category == AUTOMOTIVE_CATEGORY else ["ru", "en"]
-        job_category[job_id] = category
-        last_pdf[user_id] = (pdf_path, job_dir, category)
-        last_base_job_id[user_id] = job_id
-
-        await event.reply(f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
-        await _enqueue_langs(event, user_id, pdf_path, job_dir, langs)
+        await process_pdf(event.chat_id, user_id, pdf_path, job_dir)
         return
 
     if event.text:
         await event.reply("🤔 Не понял. Отправь PDF-файл или /help")
 
 
-async def _enqueue_langs(event, user_id: int, pdf_path: Path, job_dir: Path, langs: list):
+# ── Автослежение за каналами @arxivpaper (EN) и @arxivpaperu (RU) ───────────
+@client.on(events.NewMessage(incoming=True, chats=ARXIV_CHANNEL_EN))
+async def handle_arxiv_channel_en(event):
+    await _process_arxiv_channel_post(event, ARXIV_CHANNEL_EN, forced_langs=["en"])
+
+
+@client.on(events.NewMessage(incoming=True, chats=ARXIV_CHANNEL_RU))
+async def handle_arxiv_channel_ru(event):
+    await _process_arxiv_channel_post(event, ARXIV_CHANNEL_RU, forced_langs=["ru"])
+
+
+async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: list):
+    pdf_url = None
+    for entity in (event.message.entities or []):
+        url = getattr(entity, "url", None)
+        if url and "arxiv.org/pdf/" in url:
+            pdf_url = url
+            break
+
+    if not pdf_url:
+        log.info(f"@{channel_name} пост {event.message.id}: PDF-ссылка не найдена, пропускаю")
+        return
+
+    suitable, reason = is_suitable_pdf_url(pdf_url)
+    if not suitable:
+        log.warning(f"@{channel_name} пост {event.message.id}: {pdf_url} не подходит ({reason})")
+        return
+
+    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_dir = WORKSPACE / str(OWNER_ID) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = job_dir / "input.pdf"
+
+    await client.send_message(OWNER_ID, f"📄 Новая статья из @{channel_name}, скачиваю: {pdf_url}")
+    try:
+        await asyncio.to_thread(download_pdf, pdf_url, pdf_path)
+    except Exception as e:
+        await client.send_message(OWNER_ID, f"❌ Не удалось скачать {pdf_url}: {e}")
+        return
+
+    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir, forced_langs=forced_langs)
+
+
+# ── Общая обработка PDF (ручная отправка + каналы) ───────────────────────────
+async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path, forced_langs: list = None):
+    job_id = job_dir.name
+
+    await client.send_message(chat_id, "🔎 Определяю тему и куда публиковать...")
+    blocks = await asyncio.to_thread(extract_pdf, pdf_path, job_dir / "sample")
+    sample_text = "\n\n".join(b["text"] for b in blocks[:5])
+    category = gemini_ru.classify_topic(
+        pdf_path.stem, sample_text, list(config_ru2.CONFIG["playlists"].keys()))
+    if not category:
+        category = "Other"
+        log.warning(f"job {job_id}: classification failed, category='Other'")
+
+    # A channel post already knows its own language (forced_langs); only the
+    # manual-DM path derives ru/en from topic (automotive -> ru-only).
+    langs = forced_langs if forced_langs is not None else (
+        ["ru"] if category == AUTOMOTIVE_CATEGORY else ["ru", "en"])
+    job_category[job_id] = category
+    last_pdf[user_id] = (pdf_path, job_dir, category)
+    last_base_job_id[user_id] = job_id
+
+    await client.send_message(chat_id, f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
+    await _enqueue_langs(chat_id, user_id, pdf_path, job_dir, langs)
+
+
+async def _enqueue_langs(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path, langs: list):
     for lang in langs:
         lang_dir = job_dir / lang
         lang_dir.mkdir(exist_ok=True)
@@ -269,18 +332,18 @@ async def _enqueue_langs(event, user_id: int, pdf_path: Path, job_dir: Path, lan
         flag = "🇷🇺" if lang == "ru" else "🇺🇸"
 
         if pos > 1:
-            await event.reply(f"{flag} [{lang.upper()}] В очереди: позиция {pos}")
+            await client.send_message(chat_id, f"{flag} [{lang.upper()}] В очереди: позиция {pos}")
         else:
-            await event.reply(f"{flag} [{lang.upper()}] Начинаю обработку!")
+            await client.send_message(chat_id, f"{flag} [{lang.upper()}] Начинаю обработку!")
 
         job = Job(
             job_id=f"{job_dir.name}_{lang}",
             user_id=user_id,
-            chat_id=event.chat_id,
+            chat_id=chat_id,
             pdf_path=lang_pdf,
             job_dir=lang_dir,
             lang=lang,
-            progress_fn=make_progress_tracker(event.chat_id),
+            progress_fn=make_progress_tracker(chat_id),
         )
         await job_queue.enqueue(job)
 
@@ -386,7 +449,7 @@ async def _handle_retry(event, user_id: int, target: str):
     pdf_path, job_dir, category = last_pdf[user_id]
     job_category[job_dir.name] = category
     await event.reply(f"🔁 [{lang.upper()}] Начинаю обработку заново...")
-    await _enqueue_langs(event, user_id, pdf_path, job_dir, [lang])
+    await _enqueue_langs(event.chat_id, user_id, pdf_path, job_dir, [lang])
 
 
 # ── Колбэк завершения задачи ─────────────────────────────────────────────────
