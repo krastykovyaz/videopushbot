@@ -38,7 +38,7 @@ CONFIG = {
     # YouTube настройки
     'youtube': {
         'client_secrets_file': os.getenv("SECRET_YOUTUBE_FILE_En"),
-        'privacy_status': 'private',  # 'public', 'private', 'unlisted'
+        'privacy_status': 'unlisted',  # 'public', 'private', 'unlisted'
         'category_id': '22',
         'auto_upload': True,  # Автоматическая загрузка видео на YouTube
     },
