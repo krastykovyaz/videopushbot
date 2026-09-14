@@ -18,6 +18,7 @@ import config_en
 import config_ru2
 from common.gemini_client import GeminiContentGenerator
 from common.metadata import load_script_title_and_points
+from common.patreon_post import format_patreon_post
 from common.vk_uploader import VKUploader
 from common.youtube_uploader import YouTubeUploader
 from pipeline.step01_extract import extract_pdf
@@ -312,17 +313,22 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
         vk_owner_id = None
 
     lines = []
+    youtube_url = None
 
     if not vk_only:
         if entry["youtube"] and entry["youtube"].get("success"):
-            lines.append(f"▶️ YouTube: {entry['youtube']['url']} (уже опубликовано)")
+            youtube_url = entry["youtube"]["url"]
+            lines.append(f"▶️ YouTube: {youtube_url} (уже опубликовано)")
         elif yt and yt.is_authorized:
             yt_result = await asyncio.to_thread(
                 yt.upload_video, str(video_path), title, description,
                 thumbnail_path=str(thumb_path), playlist_id=playlist_id)
             entry["youtube"] = yt_result
-            lines.append(f"▶️ YouTube: {yt_result['url']}" if yt_result.get("success")
-                          else f"⚠️ YouTube: {yt_result.get('error')}")
+            if yt_result.get("success"):
+                youtube_url = yt_result["url"]
+                lines.append(f"▶️ YouTube: {youtube_url}")
+            else:
+                lines.append(f"⚠️ YouTube: {yt_result.get('error')}")
         elif yt:
             lines.append(f"⚠️ YouTube {lang.upper()} не авторизован — используй /youtube_auth {lang}")
         else:
@@ -342,6 +348,15 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
         caption=f"{flag} {title}\n📂 {category}\n\n" + "\n".join(lines),
         force_document=False,
     )
+
+    if lang == "en" and youtube_url:
+        patreon_text = format_patreon_post(title, description, youtube_url)
+        await client.send_message(
+            chat_id,
+            "📋 Готово для Patreon (нажми на блок, чтобы скопировать):\n\n"
+            f"```\n{patreon_text}\n```",
+            parse_mode="markdown",
+        )
 
 
 async def _handle_retry(event, user_id: int, target: str):
