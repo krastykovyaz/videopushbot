@@ -16,7 +16,7 @@ from telethon import TelegramClient, events
 
 import config_en
 import config_ru2
-from common.gemini_client import GeminiContentGenerator
+from common.gemini_client import GeminiContentGenerator, append_footer
 from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
 from common.pdf_source import download_pdf, is_suitable_pdf_url
@@ -59,6 +59,9 @@ job_queue = JobQueue(max_workers=MAX_WORKERS)
 
 AUTOMOTIVE_CATEGORY = "Auto Detail"
 job_category: dict[str, str] = {}      # base_job_id (timestamp) → classified category
+# base_job_id → description text lifted straight from an arxiv channel post,
+# used instead of a fresh Gemini-generated one when the job came from there.
+job_channel_description: dict[str, str] = {}
 last_pdf: dict[int, tuple] = {}        # user_id → (pdf_path, job_dir, category) of the MOST RECENT PDF, for /retry
 last_base_job_id: dict[int, str] = {}  # user_id → base_job_id of the MOST RECENT PDF, for /retry
 # f"{base_job_id}:{lang}" → {video_path, thumb_path, title, description, category, youtube, vk}
@@ -264,13 +267,34 @@ async def handle_arxiv_channel_ru(event):
     await _process_arxiv_channel_post(event, ARXIV_CHANNEL_RU, forced_langs=["ru"])
 
 
+def _extract_channel_description(raw_text: str, title: str) -> str:
+    """
+    Channel posts look like:
+        <bold header>
+        <title>                          (as a link)
+        [RU channel repeats the title again in plain text here]
+        <description paragraph>
+        📊 <score line>
+        📄 <download link>
+        🎙️ <discussion link>
+    Strips the header/title line(s) and the score+links footer, keeping only
+    the description paragraph itself.
+    """
+    body = raw_text.split("\n📊")[0]           # drop the score line + trailing links
+    lines = body.split("\n")[1:]               # drop the bold header line
+    lines = [l for l in lines if l.strip().lower() != title.strip().lower()]  # drop duplicated title line(s)
+    return "\n".join(lines).strip()
+
+
 async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: list):
     pdf_url = None
+    title = None
     for entity in (event.message.entities or []):
         url = getattr(entity, "url", None)
         if url and "arxiv.org/pdf/" in url:
             pdf_url = url
-            break
+        elif url and "arxiv.org/abs/" in url:
+            title = event.message.message[entity.offset:entity.offset + entity.length]
 
     if not pdf_url:
         log.info(f"@{channel_name} пост {event.message.id}: PDF-ссылка не найдена, пропускаю")
@@ -280,6 +304,10 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
     if not suitable:
         log.warning(f"@{channel_name} пост {event.message.id}: {pdf_url} не подходит ({reason})")
         return
+
+    channel_description = (
+        _extract_channel_description(event.message.message, title) if title else None
+    )
 
     job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     job_dir = WORKSPACE / str(OWNER_ID) / job_id
@@ -293,11 +321,13 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
         await client.send_message(OWNER_ID, f"❌ Не удалось скачать {pdf_url}: {e}")
         return
 
-    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir, forced_langs=forced_langs)
+    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
+                       forced_langs=forced_langs, channel_description=channel_description)
 
 
 # ── Общая обработка PDF (ручная отправка + каналы) ───────────────────────────
-async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path, forced_langs: list = None):
+async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path,
+                       forced_langs: list = None, channel_description: str = None):
     job_id = job_dir.name
 
     await client.send_message(chat_id, "🔎 Определяю тему и куда публиковать...")
@@ -314,6 +344,8 @@ async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path,
     langs = forced_langs if forced_langs is not None else (
         ["ru"] if category == AUTOMOTIVE_CATEGORY else ["ru", "en"])
     job_category[job_id] = category
+    if channel_description:
+        job_channel_description[job_id] = channel_description
     last_pdf[user_id] = (pdf_path, job_dir, category)
     last_base_job_id[user_id] = job_id
 
@@ -361,8 +393,12 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
 
     if entry["title"] is None:
         title, key_points = load_script_title_and_points(video_path.parent)
-        gemini = gemini_ru if lang == "ru" else gemini_en
-        entry["description"] = gemini.generate_description(title, key_points, lang=lang)
+        channel_desc = job_channel_description.get(base_job_id)
+        if channel_desc:
+            entry["description"] = append_footer(channel_desc, lang)
+        else:
+            gemini = gemini_ru if lang == "ru" else gemini_en
+            entry["description"] = gemini.generate_description(title, key_points, lang=lang)
         entry["title"] = title
     title, description = entry["title"], entry["description"]
 

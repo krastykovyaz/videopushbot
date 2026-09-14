@@ -91,6 +91,17 @@ def _is_rate_limited(err: str, type_name: str) -> bool:
             or "quota" in err.lower() or "rate limit" in err.lower())
 
 
+def append_footer(description: str, lang: str) -> str:
+    """Shared by Gemini-generated descriptions and channel-sourced ones (see
+    bot.py's arxiv channel listeners), so the support/subscribe footer is
+    consistent regardless of where the description text came from."""
+    if lang == "ru":
+        return description + _RU_FOOTER
+    elif lang == "en":
+        return description + _EN_FOOTER
+    return description
+
+
 class GeminiContentGenerator:
     def __init__(self, api_key, model_name):
         genai.configure(api_key=api_key)
@@ -124,11 +135,7 @@ class GeminiContentGenerator:
             logging.error(f"❌ Gemini error (all models failed): {e}")
             description = _FALLBACK_DESCRIPTION.get(lang, _FALLBACK_DESCRIPTION["en"]).format(title=title)
 
-        if lang == "ru":
-            description += _RU_FOOTER
-        elif lang == "en":
-            description += _EN_FOOTER
-        return description
+        return append_footer(description, lang)
 
     def classify_topic(self, title, content, categories):
         if len(content) > 3000:
