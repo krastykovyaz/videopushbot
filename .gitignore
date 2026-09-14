@@ -29,6 +29,7 @@ videos_to_upload/
 generated.jpg
 code.json
 youtube_uploads.json
+processed_arxiv_papers.json
 
 # OS
 .DS_Store

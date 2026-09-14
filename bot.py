@@ -5,14 +5,16 @@ NotebookLM Clone — Telethon userbot
 """
 
 import asyncio
+import json
 import os
+import re
 import shutil
 import logging
 from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, helpers as tl_helpers
 
 import config_en
 import config_ru2
@@ -40,6 +42,11 @@ OWNER_ID = 8591956842
 # cover the same paper and would otherwise duplicate every upload.
 ARXIV_CHANNEL_EN = "arxivpaper"
 ARXIV_CHANNEL_RU = "arxivpaperu"
+# Digest posts ("Top N papers of the Week/Month") re-list papers already
+# covered by earlier daily posts. Tracked per-language (not globally) — RU
+# and EN each need their own video for the same paper, only reprocessing
+# within the SAME language should be prevented.
+PROCESSED_ARXIV_FILE = Path("processed_arxiv_papers.json")
 
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
@@ -56,6 +63,25 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 # ── Клиент и очередь ────────────────────────────────────────────────────────
 client    = TelegramClient("notebooklm_session", API_ID, API_HASH)
 job_queue = JobQueue(max_workers=MAX_WORKERS)
+
+def _load_processed_arxiv() -> dict:
+    if PROCESSED_ARXIV_FILE.exists():
+        try:
+            data = json.loads(PROCESSED_ARXIV_FILE.read_text())
+            return {"en": set(data.get("en", [])), "ru": set(data.get("ru", []))}
+        except Exception as e:
+            log.warning(f"processed_arxiv_papers.json: не удалось прочитать ({e}), начинаю с пустого")
+    return {"en": set(), "ru": set()}
+
+
+def _save_processed_arxiv():
+    PROCESSED_ARXIV_FILE.write_text(json.dumps({
+        "en": sorted(processed_arxiv_ids["en"]),
+        "ru": sorted(processed_arxiv_ids["ru"]),
+    }, indent=2))
+
+
+processed_arxiv_ids = _load_processed_arxiv()  # persists across restarts
 
 AUTOMOTIVE_CATEGORY = "Auto Detail"
 job_category: dict[str, str] = {}      # base_job_id (timestamp) → classified category
@@ -267,9 +293,46 @@ async def handle_arxiv_channel_ru(event):
     await _process_arxiv_channel_post(event, ARXIV_CHANNEL_RU, forced_langs=["ru"])
 
 
+def _arxiv_id(url: str) -> str:
+    """https://arxiv.org/pdf/2609.11109v1 -> '2609.11109' (version-stripped,
+    so a new version of an already-covered paper doesn't count as new)."""
+    m = re.search(r"(\d{4}\.\d{4,5})(v\d+)?", url)
+    return m.group(1) if m else url
+
+
+def _extract_papers(event) -> list[dict]:
+    """
+    Returns one {title, pdf_url, arxiv_id} entry per paper in the post — a
+    single-paper "Paper of the Day" post has one, a "Top N of the Week/Month"
+    digest has several. Pairs each arxiv.org/abs/ link with the very next
+    arxiv.org/pdf/ link that shares its arxiv ID (that's the order every
+    real post from this channel uses: title link immediately followed by
+    its own "pdf" link before the next paper starts).
+    """
+    # Entity offsets are in UTF-16 code units, not Python string indices — every
+    # emoji before an entity (📊, 📄, ...) is a surrogate pair in UTF-16 but a
+    # single Python character, silently shifting every later offset. Telethon's
+    # own add_surrogate/del_surrogate round-trip is the documented fix.
+    raw = tl_helpers.add_surrogate(event.message.message)
+    entities = sorted(event.message.entities or [], key=lambda e: e.offset)
+    papers = []
+    pending_title = pending_id = None
+    for entity in entities:
+        url = getattr(entity, "url", None)
+        if not url:
+            continue
+        if "arxiv.org/abs/" in url:
+            pending_title = tl_helpers.del_surrogate(raw[entity.offset:entity.offset + entity.length])
+            pending_id = _arxiv_id(url)
+        elif "arxiv.org/pdf/" in url and pending_title and _arxiv_id(url) == pending_id:
+            papers.append({"title": pending_title, "pdf_url": url, "arxiv_id": pending_id})
+            pending_title = pending_id = None
+    return papers
+
+
 def _extract_channel_description(raw_text: str, title: str) -> str:
     """
-    Channel posts look like:
+    A single-paper "Paper of the Day" post looks like:
         <bold header>
         <title>                          (as a link)
         [RU channel repeats the title again in plain text here]
@@ -278,7 +341,8 @@ def _extract_channel_description(raw_text: str, title: str) -> str:
         📄 <download link>
         🎙️ <discussion link>
     Strips the header/title line(s) and the score+links footer, keeping only
-    the description paragraph itself.
+    the description paragraph itself. (Multi-paper digests carry no
+    per-paper abstract at all, so this is only called for single-paper posts.)
     """
     body = raw_text.split("\n📊")[0]           # drop the score line + trailing links
     lines = body.split("\n")[1:]               # drop the bold header line
@@ -287,42 +351,46 @@ def _extract_channel_description(raw_text: str, title: str) -> str:
 
 
 async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: list):
-    pdf_url = None
-    title = None
-    for entity in (event.message.entities or []):
-        url = getattr(entity, "url", None)
-        if url and "arxiv.org/pdf/" in url:
-            pdf_url = url
-        elif url and "arxiv.org/abs/" in url:
-            title = event.message.message[entity.offset:entity.offset + entity.length]
-
-    if not pdf_url:
-        log.info(f"@{channel_name} пост {event.message.id}: PDF-ссылка не найдена, пропускаю")
+    lang_key = forced_langs[0]  # each channel handler passes exactly one language
+    papers = _extract_papers(event)
+    if not papers:
+        log.info(f"@{channel_name} пост {event.message.id}: PDF-ссылки не найдены, пропускаю")
         return
 
-    suitable, reason = is_suitable_pdf_url(pdf_url)
-    if not suitable:
-        log.warning(f"@{channel_name} пост {event.message.id}: {pdf_url} не подходит ({reason})")
-        return
+    for paper in papers:
+        if paper["arxiv_id"] in processed_arxiv_ids[lang_key]:
+            log.info(f"@{channel_name}: {paper['arxiv_id']} уже обработан для {lang_key}, пропускаю")
+            continue
 
-    channel_description = (
-        _extract_channel_description(event.message.message, title) if title else None
-    )
+        suitable, reason = is_suitable_pdf_url(paper["pdf_url"])
+        if not suitable:
+            log.warning(f"@{channel_name}: {paper['pdf_url']} не подходит ({reason})")
+            continue
 
-    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    job_dir = WORKSPACE / str(OWNER_ID) / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = job_dir / "input.pdf"
+        # Only single-paper posts carry a real abstract paragraph to reuse.
+        channel_description = (
+            _extract_channel_description(event.message.message, paper["title"])
+            if len(papers) == 1 else None
+        )
 
-    await client.send_message(OWNER_ID, f"📄 Новая статья из @{channel_name}, скачиваю: {pdf_url}")
-    try:
-        await asyncio.to_thread(download_pdf, pdf_url, pdf_path)
-    except Exception as e:
-        await client.send_message(OWNER_ID, f"❌ Не удалось скачать {pdf_url}: {e}")
-        return
+        job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        job_dir = WORKSPACE / str(OWNER_ID) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = job_dir / "input.pdf"
 
-    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
-                       forced_langs=forced_langs, channel_description=channel_description)
+        await client.send_message(
+            OWNER_ID, f"📄 Новая статья из @{channel_name}: {paper['title']}\nСкачиваю: {paper['pdf_url']}")
+        try:
+            await asyncio.to_thread(download_pdf, paper["pdf_url"], pdf_path)
+        except Exception as e:
+            await client.send_message(OWNER_ID, f"❌ Не удалось скачать {paper['pdf_url']}: {e}")
+            continue
+
+        processed_arxiv_ids[lang_key].add(paper["arxiv_id"])
+        _save_processed_arxiv()
+
+        await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
+                           forced_langs=forced_langs, channel_description=channel_description)
 
 
 # ── Общая обработка PDF (ручная отправка + каналы) ───────────────────────────
