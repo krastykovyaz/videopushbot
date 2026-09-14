@@ -46,6 +46,18 @@ _FALLBACK_DESCRIPTION = {
     "en": "Overview: {title}",
 }
 
+_RU_FOOTER = (
+    "\n\nПоддержка: https://boosty.to/krastykovyaz\n"
+    "Подписывайся - https://t.me/arxivpaper\n"
+    "создано с помощью NotebookLM"
+)
+
+_EN_FOOTER = (
+    "\n\nDonats: https://www.patreon.com/c/luxak\n\n"
+    "subscribe - https://t.me/arxivpaper\n"
+    "created with NotebookLM"
+)
+
 _CLASSIFY_PROMPT = """
 You are a content classifier for a YouTube/VK channel network.
 
@@ -107,10 +119,16 @@ class GeminiContentGenerator:
             title=title, content=content)
 
         try:
-            return self._generate(prompt)
+            description = self._generate(prompt)
         except Exception as e:
             logging.error(f"❌ Gemini error (all models failed): {e}")
-            return _FALLBACK_DESCRIPTION.get(lang, _FALLBACK_DESCRIPTION["en"]).format(title=title)
+            description = _FALLBACK_DESCRIPTION.get(lang, _FALLBACK_DESCRIPTION["en"]).format(title=title)
+
+        if lang == "ru":
+            description += _RU_FOOTER
+        elif lang == "en":
+            description += _EN_FOOTER
+        return description
 
     def classify_topic(self, title, content, categories):
         if len(content) > 3000:
