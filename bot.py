@@ -15,6 +15,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, helpers as tl_helpers
+from telethon.tl.functions.channels import JoinChannelRequest
 
 import config_en
 import config_ru2
@@ -575,11 +576,29 @@ async def on_job_done(job: "Job", video_path, thumb_path, error):
     await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
 
 
+async def _ensure_joined(channel_username: str):
+    """
+    events.NewMessage only delivers real-time updates for channels the
+    account has actually joined — get_messages()/get_entity() work for any
+    public channel by username regardless of membership, which is why this
+    can silently look fine in testing while the live listener never fires.
+    Idempotent: joining an already-joined channel is a harmless no-op.
+    """
+    try:
+        entity = await client.get_entity(channel_username)
+        await client(JoinChannelRequest(entity))
+        log.info(f"@{channel_username}: подписка подтверждена")
+    except Exception as e:
+        log.warning(f"@{channel_username}: не удалось подписаться ({e})")
+
+
 # ── Старт ────────────────────────────────────────────────────────────────────
 async def main():
     log.info("Запуск NotebookLM userbot...")
     await client.start(phone=PHONE_NUMBER)
     log.info("Клиент подключён. Ожидаем сообщения...")
+    await _ensure_joined(ARXIV_CHANNEL_EN)
+    await _ensure_joined(ARXIV_CHANNEL_RU)
     asyncio.create_task(job_queue.run(on_done_callback=on_job_done))
     await client.run_until_disconnected()
 
