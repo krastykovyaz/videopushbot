@@ -5,6 +5,7 @@ and adds topic classification for automatic channel routing.
 """
 
 import logging
+import re
 
 import google.generativeai as genai
 
@@ -155,3 +156,31 @@ class GeminiContentGenerator:
                 return category
         logging.warning(f"⚠️ classify_topic: unrecognized answer '{answer}', no category matched")
         return None
+
+    def pick_most_interesting(self, candidates: list[dict]) -> int:
+        """candidates: [{"title": str, "snippet": str}, ...]. Returns the
+        index of the single most interesting/newsworthy one, or 0 as a safe
+        fallback if Gemini's answer can't be parsed."""
+        listing = "\n\n".join(
+            f"[{i}] {c['title']}\n{c.get('snippet', '')[:300]}"
+            for i, c in enumerate(candidates)
+        )
+        prompt = (
+            "Ниже — список свежих новостей. Выбери ОДНУ самую интересную и "
+            "значимую для широкой аудитории (не узкоспециальную, с потенциалом "
+            "вызвать эмоции или дискуссию). Ответь ТОЛЬКО номером в квадратных "
+            f"скобках, без пояснений.\n\n{listing}"
+        )
+        try:
+            answer = self._generate(prompt)
+        except Exception as e:
+            logging.error(f"❌ Gemini pick_most_interesting error (all models failed): {e}")
+            return 0
+
+        match = re.search(r"\d+", answer)
+        if match:
+            idx = int(match.group())
+            if 0 <= idx < len(candidates):
+                return idx
+        logging.warning(f"⚠️ pick_most_interesting: unparseable answer '{answer}', defaulting to 0")
+        return 0

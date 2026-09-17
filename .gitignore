@@ -30,6 +30,9 @@ generated.jpg
 code.json
 youtube_uploads.json
 processed_arxiv_papers.json
+processed_coindesk_articles.json
+processed_ru_auto_stories.json
+processed_quarterly_digests.json
 
 # OS
 .DS_Store

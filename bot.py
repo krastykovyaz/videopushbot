@@ -24,7 +24,10 @@ from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
 from common.pdf_source import download_pdf, is_suitable_pdf_url
 from common.vk_uploader import VKUploader
-from common.webpage_extract import extract_webpage, find_article_links
+from common.webpage_extract import (
+    extract_webpage, find_article_links, find_ru_auto_links, extract_page_title,
+    find_quarterly_digest_candidates,
+)
 from common.youtube_uploader import YouTubeUploader
 from pipeline.step01_extract import extract_pdf
 from queue_worker import JobQueue, Job
@@ -58,6 +61,18 @@ COINDESK_NEWSLETTERS = [
 ]
 COINDESK_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 PROCESSED_COINDESK_FILE = Path("processed_coindesk_articles.json")
+
+# Daily RU auto-news pick: one story a day, chosen by Gemini from fresh
+# candidates across za rulem / kolesa.ru / autonews.ru. RU-only, always
+# routed to Auto Detail (matches the existing automotive routing rule).
+RU_AUTO_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+PROCESSED_RU_AUTO_FILE = Path("processed_ru_auto_stories.json")
+
+# Quarterly all-countries car-import digest ("итоги квартала"): rare,
+# event-driven articles, so checked every few days rather than daily —
+# frequent enough to catch one within a few days of publication.
+QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS = 3 * 24 * 60 * 60
+PROCESSED_QUARTERLY_DIGEST_FILE = Path("processed_quarterly_digests.json")
 
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
@@ -105,7 +120,35 @@ def _save_processed_coindesk():
     PROCESSED_COINDESK_FILE.write_text(json.dumps(sorted(processed_coindesk_urls), indent=2))
 
 
+def _load_processed_ru_auto() -> set:
+    if PROCESSED_RU_AUTO_FILE.exists():
+        try:
+            return set(json.loads(PROCESSED_RU_AUTO_FILE.read_text()))
+        except Exception as e:
+            log.warning(f"processed_ru_auto_stories.json: не удалось прочитать ({e}), начинаю с пустого")
+    return set()
+
+
+def _save_processed_ru_auto():
+    PROCESSED_RU_AUTO_FILE.write_text(json.dumps(sorted(processed_ru_auto_urls), indent=2))
+
+
+def _load_processed_quarterly_digest() -> set:
+    if PROCESSED_QUARTERLY_DIGEST_FILE.exists():
+        try:
+            return set(json.loads(PROCESSED_QUARTERLY_DIGEST_FILE.read_text()))
+        except Exception as e:
+            log.warning(f"processed_quarterly_digests.json: не удалось прочитать ({e}), начинаю с пустого")
+    return set()
+
+
+def _save_processed_quarterly_digest():
+    PROCESSED_QUARTERLY_DIGEST_FILE.write_text(json.dumps(sorted(processed_quarterly_digest_urls), indent=2))
+
+
 processed_coindesk_urls = _load_processed_coindesk()
+processed_ru_auto_urls  = _load_processed_ru_auto()
+processed_quarterly_digest_urls = _load_processed_quarterly_digest()
 
 
 processed_arxiv_ids = _load_processed_arxiv()  # persists across restarts
@@ -551,6 +594,95 @@ async def _check_coindesk_newsletters():
         await asyncio.sleep(COINDESK_CHECK_INTERVAL_SECONDS)
 
 
+# ── Ежедневный выбор одного авто-сюжета (за рулем / kolesa.ru / autonews.ru) ─
+async def _process_ru_auto_story(url: str, title: str):
+    if url in processed_ru_auto_urls:
+        return
+
+    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_dir = WORKSPACE / str(OWNER_ID) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    await client.send_message(OWNER_ID, f"🚗 Сюжет дня (авто): {title}\n{url}")
+    try:
+        blocks = await asyncio.to_thread(extract_webpage, url, job_dir)
+    except Exception as e:
+        await client.send_message(OWNER_ID, f"❌ Не удалось обработать {url}: {e}")
+        return
+
+    # Source is automotive by construction (all 3 sites are auto-only), so no
+    # classification call is needed — routes RU-only per the existing rule.
+    job_category[job_id] = AUTOMOTIVE_CATEGORY
+    last_base_job_id[OWNER_ID] = job_id
+
+    processed_ru_auto_urls.add(url)
+    _save_processed_ru_auto()
+
+    await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
+    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
+
+
+async def _check_ru_auto_daily():
+    while True:
+        try:
+            links = await asyncio.to_thread(find_ru_auto_links, 5)
+            new_links = [l for l in links if l not in processed_ru_auto_urls]
+
+            candidates = []
+            for url in new_links:
+                try:
+                    title = await asyncio.to_thread(extract_page_title, url)
+                    candidates.append({"title": title, "url": url})
+                except Exception as e:
+                    log.warning(f"RU auto: title fetch failed for {url}: {e}")
+
+            if candidates:
+                idx = await asyncio.to_thread(gemini_ru.pick_most_interesting, candidates)
+                chosen = candidates[idx]
+                await _process_ru_auto_story(chosen["url"], chosen["title"])
+        except Exception as e:
+            log.error(f"RU auto: ежедневная проверка не удалась: {e}")
+        await asyncio.sleep(RU_AUTO_CHECK_INTERVAL_SECONDS)
+
+
+# ── Квартальный обзор импорта авто по всем странам-партнёрам ─────────────────
+async def _process_quarterly_digest(url: str, title: str):
+    if url in processed_quarterly_digest_urls:
+        return
+
+    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_dir = WORKSPACE / str(OWNER_ID) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    await client.send_message(OWNER_ID, f"📊 Квартальный обзор импорта авто: {title}\n{url}")
+    try:
+        blocks = await asyncio.to_thread(extract_webpage, url, job_dir)
+    except Exception as e:
+        await client.send_message(OWNER_ID, f"❌ Не удалось обработать {url}: {e}")
+        return
+
+    job_category[job_id] = AUTOMOTIVE_CATEGORY
+    last_base_job_id[OWNER_ID] = job_id
+
+    processed_quarterly_digest_urls.add(url)
+    _save_processed_quarterly_digest()
+
+    await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
+    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
+
+
+async def _check_quarterly_digest():
+    while True:
+        try:
+            candidates = await asyncio.to_thread(find_quarterly_digest_candidates, 20)
+            for c in candidates:
+                if c["url"] not in processed_quarterly_digest_urls:
+                    await _process_quarterly_digest(c["url"], c["title"])
+        except Exception as e:
+            log.error(f"Квартальный обзор: проверка не удалась: {e}")
+        await asyncio.sleep(QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS)
+
+
 # ── Публикация (переиспользуется при обычном запуске и при /retry) ──────────
 async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, category: str,
                     video_path: Path, thumb_path: Path, vk_only: bool = False):
@@ -703,6 +835,8 @@ async def main():
     await _ensure_joined(ARXIV_CHANNEL_RU)
     asyncio.create_task(job_queue.run(on_done_callback=on_job_done))
     asyncio.create_task(_check_coindesk_newsletters())
+    asyncio.create_task(_check_ru_auto_daily())
+    asyncio.create_task(_check_quarterly_digest())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
