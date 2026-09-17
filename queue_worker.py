@@ -22,6 +22,10 @@ class Job:
     job_dir:     Path
     lang:        str                          # "ru" | "en"
     progress_fn: Callable[[int, str], Awaitable[None]]  # progress(chat_id, text)
+    # When set, skips step 1 (PDF extraction) and uses this instead — same
+    # shape as step01_extract.extract_pdf()'s return value. Used for
+    # non-PDF sources (e.g. web articles via common/webpage_extract.py).
+    pre_extracted_blocks: list = field(default=None)
 
 
 class JobQueue:
@@ -88,11 +92,16 @@ async def run_pipeline(job: Job) -> tuple[Path, Path]:
     d = job.job_dir
 
     # Шаг 1 — Извлечение
-    await p(cid, "⏳ Шаг 1/6 — извлекаю текст и картинки из PDF...")
-    blocks = await asyncio.to_thread(extract_pdf, job.pdf_path, d)
-    n_pages = len(blocks)
-    n_imgs  = sum(len(b.get("images", [])) for b in blocks)
-    await p(cid, f"✅ Шаг 1/6 — извлечено: {n_pages} стр., {n_imgs} изображений")
+    if job.pre_extracted_blocks is not None:
+        blocks = job.pre_extracted_blocks
+        n_imgs = sum(len(b.get("images", [])) for b in blocks)
+        await p(cid, f"✅ Шаг 1/6 — контент уже извлечён: {n_imgs} изображений")
+    else:
+        await p(cid, "⏳ Шаг 1/6 — извлекаю текст и картинки из PDF...")
+        blocks = await asyncio.to_thread(extract_pdf, job.pdf_path, d)
+        n_pages = len(blocks)
+        n_imgs  = sum(len(b.get("images", [])) for b in blocks)
+        await p(cid, f"✅ Шаг 1/6 — извлечено: {n_pages} стр., {n_imgs} изображений")
 
     # Шаг 2 — Скрипт
     await p(cid, "⏳ Шаг 2/6 — генерирую скрипт диалога (LLM)...")

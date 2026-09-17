@@ -24,6 +24,7 @@ from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
 from common.pdf_source import download_pdf, is_suitable_pdf_url
 from common.vk_uploader import VKUploader
+from common.webpage_extract import extract_webpage, find_article_links
 from common.youtube_uploader import YouTubeUploader
 from pipeline.step01_extract import extract_pdf
 from queue_worker import JobQueue, Job
@@ -48,6 +49,15 @@ ARXIV_CHANNEL_RU = "arxivpaperu"
 # and EN each need their own video for the same paper, only reprocessing
 # within the SAME language should be prevented.
 PROCESSED_ARXIV_FILE = Path("processed_arxiv_papers.json")
+
+# Daily crypto-newsletter check: new articles get BOTH ru+en videos (this
+# content is never automotive, so the usual ru-only exception never applies).
+COINDESK_NEWSLETTERS = [
+    "https://www.coindesk.com/newsletters/crypto-long-short",
+    "https://www.coindesk.com/newsletters/state-of-crypto",
+]
+COINDESK_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+PROCESSED_COINDESK_FILE = Path("processed_coindesk_articles.json")
 
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
@@ -80,6 +90,22 @@ def _save_processed_arxiv():
         "en": sorted(processed_arxiv_ids["en"]),
         "ru": sorted(processed_arxiv_ids["ru"]),
     }, indent=2))
+
+
+def _load_processed_coindesk() -> set:
+    if PROCESSED_COINDESK_FILE.exists():
+        try:
+            return set(json.loads(PROCESSED_COINDESK_FILE.read_text()))
+        except Exception as e:
+            log.warning(f"processed_coindesk_articles.json: не удалось прочитать ({e}), начинаю с пустого")
+    return set()
+
+
+def _save_processed_coindesk():
+    PROCESSED_COINDESK_FILE.write_text(json.dumps(sorted(processed_coindesk_urls), indent=2))
+
+
+processed_coindesk_urls = _load_processed_coindesk()
 
 
 processed_arxiv_ids = _load_processed_arxiv()  # persists across restarts
@@ -449,6 +475,82 @@ async def _enqueue_langs(chat_id: int, user_id: int, pdf_path: Path, job_dir: Pa
         await job_queue.enqueue(job)
 
 
+async def _enqueue_langs_webpage(chat_id: int, user_id: int, blocks: list, job_dir: Path, langs: list):
+    """Same as _enqueue_langs, but for a webpage source: no PDF to copy per
+    language, the already-extracted blocks (text+images) are shared as-is —
+    run_pipeline skips its own extraction step when pre_extracted_blocks is set."""
+    for lang in langs:
+        lang_dir = job_dir / lang
+        lang_dir.mkdir(exist_ok=True)
+
+        pos  = job_queue.queue_size() + 1
+        flag = "🇷🇺" if lang == "ru" else "🇺🇸"
+
+        if pos > 1:
+            await client.send_message(chat_id, f"{flag} [{lang.upper()}] В очереди: позиция {pos}")
+        else:
+            await client.send_message(chat_id, f"{flag} [{lang.upper()}] Начинаю обработку!")
+
+        job = Job(
+            job_id=f"{job_dir.name}_{lang}",
+            user_id=user_id,
+            chat_id=chat_id,
+            pdf_path=job_dir / "source_url.txt",  # unused: pre_extracted_blocks skips step 1
+            job_dir=lang_dir,
+            lang=lang,
+            progress_fn=make_progress_tracker(chat_id),
+            pre_extracted_blocks=blocks,
+        )
+        await job_queue.enqueue(job)
+
+
+# ── Ежедневная проверка крипто-рассылок CoinDesk ─────────────────────────────
+async def _process_coindesk_article(url: str):
+    if url in processed_coindesk_urls:
+        return
+
+    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_dir = WORKSPACE / str(OWNER_ID) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    await client.send_message(OWNER_ID, f"📰 Новая статья CoinDesk, скачиваю: {url}")
+    try:
+        blocks = await asyncio.to_thread(extract_webpage, url, job_dir)
+    except Exception as e:
+        await client.send_message(OWNER_ID, f"❌ Не удалось обработать {url}: {e}")
+        return
+
+    sample_text = blocks[0]["text"][:3000]
+    category = gemini_ru.classify_topic(
+        url.rsplit("/", 1)[-1], sample_text, list(config_ru2.CONFIG["playlists"].keys()))
+    if not category:
+        category = "Crypto Ideas"  # sane default given the source
+        log.warning(f"coindesk {url}: classification failed, defaulting to 'Crypto Ideas'")
+
+    langs = ["ru"] if category == AUTOMOTIVE_CATEGORY else ["ru", "en"]
+    job_category[job_id] = category
+    last_base_job_id[OWNER_ID] = job_id
+
+    processed_coindesk_urls.add(url)
+    _save_processed_coindesk()
+
+    await client.send_message(OWNER_ID, f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
+    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, langs)
+
+
+async def _check_coindesk_newsletters():
+    while True:
+        for newsletter_url in COINDESK_NEWSLETTERS:
+            try:
+                links = await asyncio.to_thread(find_article_links, newsletter_url, 5)
+                for link in reversed(links):  # process oldest-of-the-batch first
+                    if link not in processed_coindesk_urls:
+                        await _process_coindesk_article(link)
+            except Exception as e:
+                log.error(f"CoinDesk: проверка {newsletter_url} не удалась: {e}")
+        await asyncio.sleep(COINDESK_CHECK_INTERVAL_SECONDS)
+
+
 # ── Публикация (переиспользуется при обычном запуске и при /retry) ──────────
 async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, category: str,
                     video_path: Path, thumb_path: Path, vk_only: bool = False):
@@ -600,6 +702,7 @@ async def main():
     await _ensure_joined(ARXIV_CHANNEL_EN)
     await _ensure_joined(ARXIV_CHANNEL_RU)
     asyncio.create_task(job_queue.run(on_done_callback=on_job_done))
+    asyncio.create_task(_check_coindesk_newsletters())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
