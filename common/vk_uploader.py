@@ -13,6 +13,11 @@ import requests
 class VKUploader:
     API_URL = "https://api.vk.com/method"
     API_VERSION = "5.131"
+    # Requests without a timeout can hang forever on a stalled connection —
+    # since the pipeline's single worker blocks on this call, that freezes
+    # the whole queue until the process is restarted.
+    API_TIMEOUT = 30
+    UPLOAD_TIMEOUT = 600
 
     def __init__(self, access_token):
         self.token = access_token
@@ -21,7 +26,7 @@ class VKUploader:
     def _api(self, method, params):
         params['access_token'] = self.token
         params['v'] = self.API_VERSION
-        resp = requests.post(f"{self.API_URL}/{method}", data=params).json()
+        resp = requests.post(f"{self.API_URL}/{method}", data=params, timeout=self.API_TIMEOUT).json()
         if 'error' in resp:
             raise Exception(f"VK API error {resp['error']['error_code']}: {resp['error']['error_msg']}")
         return resp['response']
@@ -47,7 +52,7 @@ class VKUploader:
             logging.info(f"VK: got upload URL, video_id={video_id}")
 
             with open(video_path, 'rb') as f:
-                upload_resp = requests.post(upload_url, files={'video_file': f})
+                upload_resp = requests.post(upload_url, files={'video_file': f}, timeout=self.UPLOAD_TIMEOUT)
 
             if upload_resp.status_code != 200:
                 raise Exception(f"Upload failed: HTTP {upload_resp.status_code}")
@@ -55,11 +60,10 @@ class VKUploader:
             logging.info("VK: file uploaded, waiting for processing...")
             time.sleep(5)
 
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                try:
-                    self._upload_cover(abs(owner_id), thumbnail_path)
-                except Exception as e:
-                    logging.error(f"❌ VK cover: {e}")
+            # NOTE: this used to also call _upload_cover() here, overwriting the
+            # community's cover photo with each video's thumbnail — every new
+            # publish silently replaced whatever cover the community had set.
+            # _upload_cover() is kept below for deliberate/manual use only.
 
             video_url = f"https://vk.com/video{owner_id_result}_{video_id}"
             logging.info(f"✅ VK: {video_url}")
@@ -76,7 +80,7 @@ class VKUploader:
             'crop_x2': 1590, 'crop_y2': 400
         })
         with open(image_path, 'rb') as f:
-            resp = requests.post(upload_info['upload_url'], files={'photo': f}).json()
+            resp = requests.post(upload_info['upload_url'], files={'photo': f}, timeout=self.UPLOAD_TIMEOUT).json()
         self._api('photos.saveOwnerCoverPhoto', {
             'hash': resp['hash'],
             'photo': resp['photo']

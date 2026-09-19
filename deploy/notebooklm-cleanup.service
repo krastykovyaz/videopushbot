@@ -7,7 +7,12 @@ Type=oneshot
 User=YOUR_LINUX_USER
 WorkingDirectory=/path/to/video_posting
 ExecStart=/path/to/video_posting/venv/bin/python3 cleanup.py
-# Docker isn't used by this project itself, but prunes any unused
+# Docker isn't used by this project itself, but prunes dangling
 # images/containers/build cache system-wide if Docker happens to be
 # installed on the same small server. No-ops harmlessly if it isn't.
-ExecStartPost=-/bin/sh -c 'command -v docker >/dev/null && docker system prune -af --volumes || true'
+# Deliberately NOT `-a --volumes`: this server may run other services under
+# Docker, and `-a` removes any image not currently backing a running
+# container while `--volumes` deletes unused volumes — either can destroy
+# another service's data. Only truly dangling (untagged, unreferenced)
+# resources are removed here.
+ExecStartPost=-/bin/sh -c 'command -v docker >/dev/null && docker system prune -f || true'

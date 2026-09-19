@@ -28,7 +28,7 @@ PROMPTS = {
 Напиши живой диалог двух ведущих (Host1 и Host2) по материалу статьи.
 
 ПРАВИЛА:
-- Длина: СТРОГО 3500–3800 слов. Это ~7 минут при русской озвучке. НЕ БОЛЬШЕ. Считай слова.
+- Длина: СТРОГО 800–900 слов. Это ~7 минут при русской озвучке (~125 слов/мин). НЕ БОЛЬШЕ. Считай слова.
 - Тон: умный, живой, как у лучших научпоп подкастов — Lex Fridman, Huberman Lab
 - Host1 объясняет и углубляется в детали, Host2 задаёт острые вопросы и добавляет контекст
 - Используй конкретные факты, цифры, примеры из статьи — не обобщай
@@ -68,7 +68,7 @@ image_index — индекс из списка изображений (0-based),
 Write a lively dialogue between two hosts (Host1 and Host2) based on the article.
 
 RULES:
-- Length: STRICTLY 3000–3500 words. That is ~7 minutes at natural English speaking pace. DO NOT EXCEED. Count your words.
+- Length: STRICTLY 950–1050 words. That is ~7 minutes at natural TTS speaking pace (~150 words/min). DO NOT EXCEED. Count your words.
 - Tone: smart, curious, like Lex Fridman or Huberman Lab — not corporate, not stiff
 - Host1 explains and digs into details, Host2 asks sharp questions and adds context
 - Use specific facts, numbers, examples from the article — no vague generalisations
@@ -200,16 +200,21 @@ async def generate_script(blocks: list[dict], job_dir: Path, lang: str = "ru") -
 
     script = _parse_json(response_text)
 
-    # Жёсткая обрезка по языку:
-    # EN: ~150 слов/мин → 7 мин = 1050 слов (с паузами ~3500 слов в тексте)
-    # RU: ~120 слов/мин → 7 мин = 840 слов (с паузами ~3800 слов в тексте)
-    max_w = 3500 if lang == "en" else 3800
+    # Жёсткая обрезка по языку — целимся в ~7 минут итогового видео.
+    # Ранее здесь стояло 3500/3800: даже сценарий из 2628 слов (в пределах
+    # старого лимита) давал 17 минут видео вместо 7 — сам комментарий уже
+    # содержал верный расчёт (150/125 слов/мин), просто не применялся.
+    # EN: ~150 слов/мин → 7 мин ≈ 1050 слов
+    # RU: ~125 слов/мин → 7 мин ≈ 900 слов
+    max_w = 1050 if lang == "en" else 900
     script = _trim_script(script, max_words=max_w)
 
     # Привязать реальные пути изображений к сегментам
     flat_images = [img for b in blocks for img in b["images"]]
     for seg in script.get("segments", []):
         idx = seg.get("image_index", -1)
+        if not isinstance(idx, int):  # LLM occasionally emits null or a string
+            idx = -1
         if 0 <= idx < len(flat_images):
             seg["image_path"] = flat_images[idx]["path"]
             seg["image_caption"] = flat_images[idx]["caption"]
@@ -258,7 +263,8 @@ async def _call_gemini_then_groq(prompt_full: str, prompt_short: str, lang: str)
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
             model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(model.generate_content, prompt_full)
+            response = await asyncio.to_thread(
+                model.generate_content, prompt_full, request_options={"timeout": 60})
             log.info(f"Gemini {model_name}: успешно")
             return response.text
         except Exception as e:

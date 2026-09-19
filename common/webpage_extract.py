@@ -112,17 +112,29 @@ def _extract_images(html: str, page_url: str, img_dir: Path) -> list[dict]:
     return images
 
 
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # a scraped page's image URL is untrusted input
+
+
 def _download_image(url: str, img_dir: Path, idx: int) -> str | None:
     try:
-        r = requests.get(url, headers=_HEADERS, timeout=20)
-        r.raise_for_status()
-        if "image" not in r.headers.get("Content-Type", ""):
+        with requests.get(url, headers=_HEADERS, timeout=20, stream=True) as r:
+            r.raise_for_status()
+            if "image" not in r.headers.get("Content-Type", ""):
+                return None
+            content_type = r.headers.get("Content-Type", "")
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > _MAX_IMAGE_BYTES:
+                    log.warning(f"webpage_extract: {url} exceeded {_MAX_IMAGE_BYTES} bytes, aborting download")
+                    return None
+                chunks.append(chunk)
+        if total < _MIN_IMAGE_BYTES:
             return None
-        if len(r.content) < _MIN_IMAGE_BYTES:
-            return None
-        ext = ".jpg" if "jpeg" in r.headers.get("Content-Type", "") else ".png"
+        ext = ".jpg" if "jpeg" in content_type else ".png"
         img_path = img_dir / f"web_{idx:02d}{ext}"
-        img_path.write_bytes(r.content)
+        img_path.write_bytes(b"".join(chunks))
         return str(img_path)
     except Exception as e:
         log.warning(f"webpage_extract: failed to download image {url}: {e}")

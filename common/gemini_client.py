@@ -104,6 +104,11 @@ def append_footer(description: str, lang: str) -> str:
 
 
 class GeminiContentGenerator:
+    # Without a timeout a stalled request can hang indefinitely; since these
+    # calls run inside the pipeline's single worker, that freezes the whole
+    # job queue until the process is restarted.
+    REQUEST_TIMEOUT_SECONDS = 60
+
     def __init__(self, api_key, model_name):
         genai.configure(api_key=api_key)
         # Try the configured model first, then rotate through the rest on quota errors.
@@ -115,7 +120,8 @@ class GeminiContentGenerator:
         for model_name in self.model_candidates:
             try:
                 model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
+                response = model.generate_content(
+                    prompt, request_options={"timeout": self.REQUEST_TIMEOUT_SECONDS})
                 return response.text.strip()
             except Exception as e:
                 last_err = e

@@ -2,6 +2,13 @@
 Description=NotebookLM-clone Telegram bot (PDF -> video -> YouTube/VK)
 After=network-online.target
 Wants=network-online.target
+# Without this, systemd's default Restart=on-failure loop is effectively
+# unbounded — a bad deploy (e.g. a missing import) can restart thousands of
+# times unnoticed instead of stopping and surfacing the failure. After 5
+# restarts in 10 minutes, systemd stops trying; `systemctl status` then
+# shows "Failed" instead of quietly cycling forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple

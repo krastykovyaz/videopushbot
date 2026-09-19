@@ -7,15 +7,18 @@ pymupdf==1.24.5
 # LLM
 google-generativeai==0.7.2
 
+# YouTube upload (imported unconditionally by common/youtube_uploader.py)
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.2.0
+
 # TTS — русский + английский: Edge TTS (Microsoft Neural, бесплатно, онлайн)
 edge-tts>=6.1.9
-# TTS — английский фоллбэк: Chatterbox (локально, MIT)
-chatterbox-tts>=0.1.0
-torchaudio>=2.0.0
-# CPU-версия torch (если нет GPU):
-# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-torch>=2.0.0
-
+# Chatterbox was an EN TTS fallback that's no longer wired into
+# pipeline/step03_tts.py's actual synthesis chain (espeak-ng CLI -> pyttsx3
+# -> Edge TTS) — dropped here since it pulled multi-GB torch/torchaudio for
+# code that never runs. _synthesize_chatterbox() still degrades gracefully
+# (ImportError -> None) if you re-add these later.
 
 # Аудио
 pydub>=0.25.1
@@ -28,9 +31,13 @@ ffmpeg-python>=0.2.0
 # Утилиты
 python-dotenv>=1.0.0
 pyttsx3>=2.90        # фоллбэк TTS (нужен espeak-ng на Linux: apt install espeak-ng)
+requests>=2.31.0     # PDF/webpage downloads, VK API
 
 httpx>=0.27.0  # для Groq fallback
 
 # Веб-статьи (CoinDesk и т.п.) как источник — вместо PDF
 beautifulsoup4>=4.12.0
 trafilatura>=1.8.0
+# trafilatura's justext dependency needs lxml.html.clean, which newer lxml
+# (>=5.2) split out into this separate package — without it, import crashes.
+lxml_html_clean>=0.1.0

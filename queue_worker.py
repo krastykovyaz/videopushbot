@@ -33,21 +33,28 @@ class JobQueue:
         self._queue: asyncio.Queue[Job] = asyncio.Queue()
         self._max_workers = max_workers
         self._active: dict[int, str] = {}    # user_id → job_id
+        # asyncio.Queue.get() is called in a tight loop below and hands each
+        # job off to its own task immediately, so _queue.qsize() drops to 0
+        # almost instantly even while MAX_WORKERS=1 keeps every task but one
+        # blocked on the semaphore — queue_size()/position() were reporting
+        # "no wait" for jobs that were, in practice, waiting hours. This
+        # tracks jobs that are enqueued but haven't actually started running.
+        self._pending: dict[str, Job] = {}   # job_id → Job
 
     def queue_size(self) -> int:
-        return self._queue.qsize()
+        return len(self._pending)
 
     def position(self, user_id: int) -> int:
         """Позиция пользователя в очереди (0 = нет задачи)."""
-        jobs = list(self._queue._queue)       # type: ignore
-        for i, job in enumerate(jobs, 1):
+        for i, job in enumerate(self._pending.values(), 1):
             if job.user_id == user_id:
                 return i
         return 0
 
     async def enqueue(self, job: Job):
+        self._pending[job.job_id] = job
         await self._queue.put(job)
-        log.info(f"Job {job.job_id} добавлен (user {job.user_id}), размер очереди: {self._queue.qsize()}")
+        log.info(f"Job {job.job_id} добавлен (user {job.user_id}), размер очереди: {len(self._pending)}")
 
     async def run(self, on_done_callback):
         """Основной цикл воркера. Запускать как asyncio.create_task()."""
@@ -55,6 +62,7 @@ class JobQueue:
 
         async def process(job: Job):
             async with semaphore:
+                self._pending.pop(job.job_id, None)
                 self._active[job.user_id] = job.job_id
                 video_path = thumb_path = None
                 error = None
@@ -65,7 +73,15 @@ class JobQueue:
                     error = str(e)
                 finally:
                     self._active.pop(job.user_id, None)
-                    await on_done_callback(job, video_path, thumb_path, error)
+                    # process() runs as a detached create_task() with nothing
+                    # awaiting it, so an exception here (e.g. on_done_callback
+                    # itself raising while publishing) would otherwise vanish
+                    # as an unretrieved task exception at GC time — the job
+                    # completes but the user never finds out.
+                    try:
+                        await on_done_callback(job, video_path, thumb_path, error)
+                    except Exception:
+                        log.exception(f"on_done_callback упал для job {job.job_id}")
 
         while True:
             job = await self._queue.get()
@@ -108,13 +124,16 @@ async def run_pipeline(job: Job) -> tuple[Path, Path]:
     script = await generate_script(blocks, d, lang=job.lang)
     word_count = sum(len(s["text"].split()) for s in script["segments"])
     est_min = word_count // 130
-    warn = " ⚠️ длиннее ожидаемого" if word_count > 5500 else ""
+    # step02_script.py now targets ~900 (ru) / ~1050 (en) words for a ~7 min
+    # video; this just flags a script that came back well over that budget.
+    warn = " ⚠️ длиннее ожидаемого" if word_count > 1300 else ""
     await p(cid, f"✅ Шаг 2/6 — скрипт готов: {word_count} слов (~{est_min} мин){warn}")
 
     # Шаг 3 — TTS
-    await p(cid, "⏳ Шаг 3/6 — озвучиваю (Chatterbox TTS)... это займёт пару минут")
-    timeline = await asyncio.to_thread(generate_tts, script, d, lang=job.lang)
-    await p(cid, f"✅ Шаг 3/6 — аудио готово: {len(timeline)} сегментов")
+    await p(cid, "⏳ Шаг 3/6 — озвучиваю (Edge TTS)... это займёт пару минут")
+    timeline, tts_fallback_count = await asyncio.to_thread(generate_tts, script, d, lang=job.lang)
+    fallback_warn = f" ⚠️ {tts_fallback_count} сегм. роботизированным голосом" if tts_fallback_count else ""
+    await p(cid, f"✅ Шаг 3/6 — аудио готово: {len(timeline)} сегментов{fallback_warn}")
 
     # Шаг 4 — Кадры
     await p(cid, "⏳ Шаг 4/6 — собираю кадры видео...")

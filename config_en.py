@@ -46,4 +46,3 @@ CONFIG = {
     'default_thumbnail': 'unnamed.png',
     'max_file_size': 2 * 1024 * 1024 * 1024,  # 2 GB
 }
-print(CONFIG['playlists']['AI Paper Review'])

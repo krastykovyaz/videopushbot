@@ -54,13 +54,20 @@ def _clean_stale_files(directory: Path, retention_seconds: float, dry_run: bool)
     return removed_files, removed_bytes
 
 
-def _prune_empty_dirs(directory: Path, dry_run: bool) -> int:
+def _prune_empty_dirs(directory: Path, min_age_seconds: float, dry_run: bool) -> int:
+    """Only removes a dir that's both empty AND older than min_age_seconds —
+    a job in progress creates its (initially empty) lang_dir well before it
+    writes anything into it, so an age-blind sweep can delete a directory a
+    queued job is about to write to."""
     if not directory.exists():
         return 0
     removed = 0
+    now = time.time()
     # Deepest first so nested empty dirs collapse correctly in one pass.
     for d in sorted((p for p in directory.rglob("*") if p.is_dir()), key=lambda p: -len(p.parts)):
         try:
+            if now - d.stat().st_mtime <= min_age_seconds:
+                continue
             if not any(d.iterdir()):
                 if not dry_run:
                     d.rmdir()
@@ -79,7 +86,7 @@ def clean_media(dry_run: bool):
             verb = "would remove" if dry_run else "removed"
             log.info(f"{name}/: {verb} {files} files older than {RETENTION_DAYS}d "
                       f"({freed / 1024**3:.2f} GB)")
-        pruned = _prune_empty_dirs(d, dry_run)
+        pruned = _prune_empty_dirs(d, retention_seconds, dry_run)
         if pruned:
             verb = "would prune" if dry_run else "pruned"
             log.info(f"{name}/: {verb} {pruned} empty directories")
@@ -102,9 +109,14 @@ def clean_logs(dry_run: bool):
         log.info(f"{f.name}: {verb} ({size / 1024**2:.1f} MB over {MAX_LOG_MB} MB cap)")
 
 
+_PYCACHE_SKIP_DIRS = {"venv", "workspace"}
+
+
 def clean_pycache(dry_run: bool):
     removed = 0
     for d in BASE_DIR.rglob("__pycache__"):
+        if _PYCACHE_SKIP_DIRS & set(d.relative_to(BASE_DIR).parts):
+            continue  # venv's own bytecode cache; workspace never has one
         if d.is_dir():
             if not dry_run:
                 shutil.rmtree(d, ignore_errors=True)

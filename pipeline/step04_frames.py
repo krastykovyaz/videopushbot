@@ -39,7 +39,10 @@ def build_frames(script: dict, timeline: list[dict], job_dir: Path, lang: str = 
     frames_dir.mkdir(exist_ok=True)
 
     fonts = _load_fonts()
-    title = script.get("title", "")
+    # draw.text(..., anchor="mm") raises ValueError on multiline text; the
+    # LLM occasionally emits a title containing "\n" despite the prompt
+    # asking for a single line, so collapse whitespace defensively.
+    title = " ".join(script.get("title", "").split())
 
     for entry in timeline:
         frame_path = frames_dir / f"frame_{entry['seg_id']:04d}.png"

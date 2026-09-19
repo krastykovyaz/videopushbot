@@ -56,6 +56,7 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
     timeline = []
     combined = AudioSegment.empty()
     current_ms = 0
+    fallback_count = 0
 
     for i, seg in enumerate(segments):
         speaker = seg.get("speaker", "host1")
@@ -67,7 +68,8 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
 
         if not wav_path.exists():
             log.info(f"TTS [{lang}/{speaker}] сег {i+1}/{len(segments)}: {text[:60]}...")
-            _synthesize_sync(text, speaker, wav_path, lang)
+            if not _synthesize_sync(text, speaker, wav_path, lang):
+                fallback_count += 1
         else:
             log.info(f"Кэш: сегмент {i+1}")
 
@@ -112,14 +114,22 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
     with open(timeline_path, "w", encoding="utf-8") as f:
         json.dump(timeline, f, ensure_ascii=False, indent=2)
 
-    return timeline
+    if fallback_count:
+        log.warning(f"{fallback_count}/{len(timeline)} сегментов озвучены фоллбэком "
+                     f"(espeak-ng/pyttsx3) вместо Edge TTS — голос местами может звучать роботизированно")
+
+    return timeline, fallback_count
 
 
-def _synthesize_sync(text: str, speaker: str, out_path: Path, lang: str):
+def _synthesize_sync(text: str, speaker: str, out_path: Path, lang: str) -> bool:
     """
     Синхронная обёртка для async Edge TTS.
     asyncio.run() не работает внутри уже запущенного loop (Telethon).
     Используем отдельный поток с новым event loop.
+
+    Возвращает True если сработал Edge TTS, False если пришлось откатиться
+    на espeak-ng/pyttsx3 (нужно вызывающему коду, чтобы посчитать деградацию
+    качества озвучки за весь эпизод).
     """
     import concurrent.futures
 
@@ -133,20 +143,28 @@ def _synthesize_sync(text: str, speaker: str, out_path: Path, lang: str):
         finally:
             loop.close()
 
+    # Managed manually (not `with`) so a timeout can abandon the background
+    # thread via shutdown(wait=False) — `with`'s implicit shutdown(wait=True)
+    # blocks on the SAME hung call the timeout was meant to give up on,
+    # making the 120s timeout a no-op and freezing the single worker on it.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(run_in_new_loop)
-            future.result(timeout=120)
+        future = ex.submit(run_in_new_loop)
+        future.result(timeout=120)
+        ex.shutdown(wait=False)
         # Проверить что файл реально создался и не пустой
         if not out_path.exists() or out_path.stat().st_size < 1000:
             raise RuntimeError(f"Edge TTS создал пустой файл: {out_path}")
         log.info(f"Edge TTS OK [{lang}/{speaker}]: {out_path.name}")
+        return True
     except Exception as e:
+        ex.shutdown(wait=False)
         log.warning(f"Edge TTS ошибка [{lang}/{speaker}]: {e}, фоллбэк...")
         if _synthesize_espeak_ng_cli(text, speaker, out_path, lang):
             log.info(f"espeak-ng CLI OK [{lang}/{speaker}]: {out_path.name}")
         else:
             _synthesize_pyttsx3(text, speaker, out_path, lang)
+        return False
 
 
 # ── Edge TTS (RU + EN) ────────────────────────────────────────────────────────

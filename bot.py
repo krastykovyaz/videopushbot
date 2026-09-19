@@ -74,6 +74,13 @@ PROCESSED_RU_AUTO_FILE = Path("processed_ru_auto_stories.json")
 QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS = 3 * 24 * 60 * 60
 PROCESSED_QUARTERLY_DIGEST_FILE = Path("processed_quarterly_digests.json")
 
+# Hard cap on how many videos actually get uploaded per channel per day —
+# protects against bursts (e.g. several auto-sources catching up on a
+# backlog at once after downtime) flooding a channel in a short window.
+# Applies to every source, manual PDFs included.
+DAILY_VIDEO_CAP = 2
+DAILY_PUBLISH_COUNT_FILE = Path("daily_publish_count.json")
+
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
@@ -146,9 +153,64 @@ def _save_processed_quarterly_digest():
     PROCESSED_QUARTERLY_DIGEST_FILE.write_text(json.dumps(sorted(processed_quarterly_digest_urls), indent=2))
 
 
+def _load_daily_publish_count() -> dict:
+    if DAILY_PUBLISH_COUNT_FILE.exists():
+        try:
+            return json.loads(DAILY_PUBLISH_COUNT_FILE.read_text())
+        except Exception as e:
+            log.warning(f"daily_publish_count.json: не удалось прочитать ({e}), начинаю с пустого")
+    return {}
+
+
+def _save_daily_publish_count():
+    DAILY_PUBLISH_COUNT_FILE.write_text(json.dumps(daily_publish_count, indent=2))
+
+
+def _today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _publishes_today(lang: str) -> int:
+    return daily_publish_count.get(_today_key(), {}).get(lang, 0)
+
+
+def _record_publish(lang: str):
+    day = daily_publish_count.setdefault(_today_key(), {})
+    day[lang] = day.get(lang, 0) + 1
+    _save_daily_publish_count()
+
+
+# Videos that were fully rendered but couldn't publish because the daily cap
+# was already hit — retried automatically by _flush_deferred_publishes()
+# instead of relying on the owner remembering to run /retry.
+DEFERRED_PUBLISH_FILE = Path("deferred_publishes.json")
+DEFERRED_FLUSH_INTERVAL_SECONDS = 30 * 60
+
+
+def _load_deferred_publishes() -> list:
+    if DEFERRED_PUBLISH_FILE.exists():
+        try:
+            return json.loads(DEFERRED_PUBLISH_FILE.read_text())
+        except Exception as e:
+            log.warning(f"deferred_publishes.json: не удалось прочитать ({e}), начинаю с пустого")
+    return []
+
+
+def _save_deferred_publishes():
+    DEFERRED_PUBLISH_FILE.write_text(json.dumps(deferred_publishes, indent=2))
+
+
 processed_coindesk_urls = _load_processed_coindesk()
 processed_ru_auto_urls  = _load_processed_ru_auto()
 processed_quarterly_digest_urls = _load_processed_quarterly_digest()
+daily_publish_count = _load_daily_publish_count()   # {"YYYY-MM-DD": {"ru": N, "en": N}}
+deferred_publishes  = _load_deferred_publishes()    # [{chat_id, user_id, base_job_id, lang, category, video_path, thumb_path, vk_only}]
+
+# Dedup for an auto-source is only committed once its job actually renders
+# successfully (in on_job_done), not the moment it's enqueued — otherwise a
+# TTS/render failure marks the item "done" forever with no retry path.
+# base_job_id -> {"set": <processed_*_urls set>, "save_fn": <its _save_* fn>, "url": str}
+job_dedup_pending: dict[str, dict] = {}
 
 
 processed_arxiv_ids = _load_processed_arxiv()  # persists across restarts
@@ -432,7 +494,7 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
             log.info(f"@{channel_name}: {paper['arxiv_id']} уже обработан для {lang_key}, пропускаю")
             continue
 
-        suitable, reason = is_suitable_pdf_url(paper["pdf_url"])
+        suitable, reason = await asyncio.to_thread(is_suitable_pdf_url, paper["pdf_url"])
         if not suitable:
             log.warning(f"@{channel_name}: {paper['pdf_url']} не подходит ({reason})")
             continue
@@ -456,8 +518,10 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
             await client.send_message(OWNER_ID, f"❌ Не удалось скачать {paper['pdf_url']}: {e}")
             continue
 
-        processed_arxiv_ids[lang_key].add(paper["arxiv_id"])
-        _save_processed_arxiv()
+        job_dedup_pending[job_id] = {
+            "set": processed_arxiv_ids[lang_key], "save_fn": _save_processed_arxiv,
+            "url": paper["arxiv_id"],
+        }
 
         await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
                            forced_langs=forced_langs, channel_description=channel_description)
@@ -471,8 +535,8 @@ async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path,
     await client.send_message(chat_id, "🔎 Определяю тему и куда публиковать...")
     blocks = await asyncio.to_thread(extract_pdf, pdf_path, job_dir / "sample")
     sample_text = "\n\n".join(b["text"] for b in blocks[:5])
-    category = gemini_ru.classify_topic(
-        pdf_path.stem, sample_text, list(config_ru2.CONFIG["playlists"].keys()))
+    category = await asyncio.to_thread(
+        gemini_ru.classify_topic, pdf_path.stem, sample_text, list(config_ru2.CONFIG["playlists"].keys()))
     if not category:
         category = "Other"
         log.warning(f"job {job_id}: classification failed, category='Other'")
@@ -496,7 +560,7 @@ async def _enqueue_langs(chat_id: int, user_id: int, pdf_path: Path, job_dir: Pa
         lang_dir = job_dir / lang
         lang_dir.mkdir(exist_ok=True)
         lang_pdf = lang_dir / "input.pdf"
-        shutil.copy2(pdf_path, lang_pdf)
+        await asyncio.to_thread(shutil.copy2, pdf_path, lang_pdf)
 
         pos  = job_queue.queue_size() + 1
         flag = "🇷🇺" if lang == "ru" else "🇺🇸"
@@ -564,8 +628,8 @@ async def _process_coindesk_article(url: str):
         return
 
     sample_text = blocks[0]["text"][:3000]
-    category = gemini_ru.classify_topic(
-        url.rsplit("/", 1)[-1], sample_text, list(config_ru2.CONFIG["playlists"].keys()))
+    category = await asyncio.to_thread(
+        gemini_ru.classify_topic, url.rsplit("/", 1)[-1], sample_text, list(config_ru2.CONFIG["playlists"].keys()))
     if not category:
         category = "Crypto Ideas"  # sane default given the source
         log.warning(f"coindesk {url}: classification failed, defaulting to 'Crypto Ideas'")
@@ -574,8 +638,9 @@ async def _process_coindesk_article(url: str):
     job_category[job_id] = category
     last_base_job_id[OWNER_ID] = job_id
 
-    processed_coindesk_urls.add(url)
-    _save_processed_coindesk()
+    job_dedup_pending[job_id] = {
+        "set": processed_coindesk_urls, "save_fn": _save_processed_coindesk, "url": url,
+    }
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, langs)
@@ -615,8 +680,9 @@ async def _process_ru_auto_story(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    processed_ru_auto_urls.add(url)
-    _save_processed_ru_auto()
+    job_dedup_pending[job_id] = {
+        "set": processed_ru_auto_urls, "save_fn": _save_processed_ru_auto, "url": url,
+    }
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
@@ -664,8 +730,9 @@ async def _process_quarterly_digest(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    processed_quarterly_digest_urls.add(url)
-    _save_processed_quarterly_digest()
+    job_dedup_pending[job_id] = {
+        "set": processed_quarterly_digest_urls, "save_fn": _save_processed_quarterly_digest, "url": url,
+    }
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
@@ -685,7 +752,7 @@ async def _check_quarterly_digest():
 
 # ── Публикация (переиспользуется при обычном запуске и при /retry) ──────────
 async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, category: str,
-                    video_path: Path, thumb_path: Path, vk_only: bool = False):
+                    video_path: Path, thumb_path: Path, vk_only: bool = False, force: bool = False):
     flag = "🇷🇺" if lang == "ru" else "🇺🇸"
 
     entry = last_result.setdefault(f"{base_job_id}:{lang}", {
@@ -701,7 +768,7 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
             entry["description"] = append_footer(channel_desc, lang)
         else:
             gemini = gemini_ru if lang == "ru" else gemini_en
-            entry["description"] = gemini.generate_description(title, key_points, lang=lang)
+            entry["description"] = await asyncio.to_thread(gemini.generate_description, title, key_points, lang=lang)
         entry["title"] = title
     title, description = entry["title"], entry["description"]
 
@@ -716,11 +783,18 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
 
     lines = []
     youtube_url = None
+    did_new_upload = False   # only true once something actually succeeds — a
+                              # failed attempt must not eat into the daily cap
+    deferred = False
+    cap_hit = not force and _publishes_today(lang) >= DAILY_VIDEO_CAP
 
     if not vk_only:
         if entry["youtube"] and entry["youtube"].get("success"):
             youtube_url = entry["youtube"]["url"]
             lines.append(f"▶️ YouTube: {youtube_url} (уже опубликовано)")
+        elif cap_hit:
+            deferred = True
+            lines.append(f"⏸ YouTube: дневной лимит ({DAILY_VIDEO_CAP}) на сегодня достигнут — опубликую автоматически позже")
         elif yt and yt.is_authorized:
             yt_result = await asyncio.to_thread(
                 yt.upload_video, str(video_path), title, description,
@@ -728,6 +802,7 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
             entry["youtube"] = yt_result
             if yt_result.get("success"):
                 youtube_url = yt_result["url"]
+                did_new_upload = True
                 lines.append(f"▶️ YouTube: {youtube_url}")
             else:
                 lines.append(f"⚠️ YouTube: {yt_result.get('error')}")
@@ -737,12 +812,24 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
             lines.append("⚠️ YouTube uploader не настроен")
 
     if lang == "ru" and vk_uploader and vk_owner_id:
-        vk_result = await asyncio.to_thread(
-            vk_uploader.upload_video, str(video_path), title, description,
-            owner_id=vk_owner_id, thumbnail_path=str(thumb_path))
-        entry["vk"] = vk_result
-        lines.append(f"📹 VK: {vk_result['url']}" if vk_result.get("success")
-                      else f"⚠️ VK: {vk_result.get('error')}")
+        if entry["vk"] and entry["vk"].get("success"):
+            lines.append(f"📹 VK: {entry['vk']['url']} (уже опубликовано)")
+        elif cap_hit:
+            deferred = True
+            lines.append(f"⏸ VK: дневной лимит ({DAILY_VIDEO_CAP}) на сегодня достигнут — опубликую автоматически позже")
+        else:
+            vk_result = await asyncio.to_thread(
+                vk_uploader.upload_video, str(video_path), title, description,
+                owner_id=vk_owner_id, thumbnail_path=str(thumb_path))
+            entry["vk"] = vk_result
+            if vk_result.get("success"):
+                did_new_upload = True
+                lines.append(f"📹 VK: {vk_result['url']}")
+            else:
+                lines.append(f"⚠️ VK: {vk_result.get('error')}")
+
+    if did_new_upload:
+        _record_publish(lang)
 
     await client.send_file(
         chat_id,
@@ -760,6 +847,8 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
             parse_mode="markdown",
         )
 
+    return not deferred
+
 
 async def _handle_retry(event, user_id: int, target: str):
     base_job_id = last_base_job_id.get(user_id)  # most recently received PDF's job
@@ -769,17 +858,17 @@ async def _handle_retry(event, user_id: int, target: str):
         if not entry or not entry.get("video_path"):
             await event.reply("⚠️ Нет готового RU-видео для повторной публикации в VK. Отправь PDF заново.")
             return
-        await event.reply("🔁 Повторяю публикацию в VK...")
+        await event.reply("🔁 Повторяю публикацию в VK (в обход дневного лимита)...")
         await _publish(event.chat_id, user_id, base_job_id, "ru", entry["category"],
-                        entry["video_path"], entry["thumb_path"], vk_only=True)
+                        entry["video_path"], entry["thumb_path"], vk_only=True, force=True)
         return
 
     lang = target
     entry = last_result.get(f"{base_job_id}:{lang}") if base_job_id else None
     if entry and entry.get("video_path"):
-        await event.reply(f"🔁 [{lang.upper()}] Видео уже готово, повторяю публикацию...")
+        await event.reply(f"🔁 [{lang.upper()}] Видео уже готово, повторяю публикацию (в обход дневного лимита)...")
         await _publish(event.chat_id, user_id, base_job_id, lang, entry["category"],
-                        entry["video_path"], entry["thumb_path"])
+                        entry["video_path"], entry["thumb_path"], force=True)
         return
 
     if user_id not in last_pdf:
@@ -792,8 +881,21 @@ async def _handle_retry(event, user_id: int, target: str):
 
 
 # ── Колбэк завершения задачи ─────────────────────────────────────────────────
+def _register_deferred(chat_id, user_id, base_job_id, lang, category, video_path, thumb_path, vk_only):
+    key = f"{base_job_id}:{lang}:{vk_only}"
+    if any(f"{d['base_job_id']}:{d['lang']}:{d['vk_only']}" == key for d in deferred_publishes):
+        return
+    deferred_publishes.append({
+        "chat_id": chat_id, "user_id": user_id, "base_job_id": base_job_id, "lang": lang,
+        "category": category, "video_path": str(video_path), "thumb_path": str(thumb_path),
+        "vk_only": vk_only,
+    })
+    _save_deferred_publishes()
+
+
 async def on_job_done(job: "Job", video_path, thumb_path, error):
     flag = "🇷🇺" if job.lang == "ru" else "🇺🇸"
+    base_job_id = job.job_dir.parent.name
 
     if error:
         await client.send_message(
@@ -803,11 +905,36 @@ async def on_job_done(job: "Job", video_path, thumb_path, error):
         )
         return
 
-    base_job_id = job.job_dir.parent.name
+    # Rendering succeeded — only now is it safe to mark the source item as
+    # "done" so a render failure doesn't permanently skip it.
+    pending = job_dedup_pending.pop(base_job_id, None)
+    if pending:
+        pending["set"].add(pending["url"])
+        pending["save_fn"]()
+
     category = job_category.get(base_job_id, "Other")
 
     await client.send_message(job.chat_id, f"{flag} Видео готово, публикую...")
-    await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
+    fully_published = await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
+    if not fully_published:
+        _register_deferred(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path, vk_only=False)
+
+
+async def _flush_deferred_publishes():
+    while True:
+        await asyncio.sleep(DEFERRED_FLUSH_INTERVAL_SECONDS)
+        for entry in list(deferred_publishes):
+            try:
+                fully_published = await _publish(
+                    entry["chat_id"], entry["user_id"], entry["base_job_id"], entry["lang"],
+                    entry["category"], Path(entry["video_path"]), Path(entry["thumb_path"]),
+                    vk_only=entry["vk_only"])
+            except Exception as e:
+                log.error(f"Отложенная публикация {entry['base_job_id']}:{entry['lang']} не удалась: {e}")
+                continue
+            if fully_published:
+                deferred_publishes.remove(entry)
+                _save_deferred_publishes()
 
 
 async def _ensure_joined(channel_username: str):
@@ -837,6 +964,7 @@ async def main():
     asyncio.create_task(_check_coindesk_newsletters())
     asyncio.create_task(_check_ru_auto_daily())
     asyncio.create_task(_check_quarterly_digest())
+    asyncio.create_task(_flush_deferred_publishes())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
