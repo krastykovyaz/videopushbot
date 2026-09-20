@@ -58,6 +58,27 @@ def is_suitable_pdf_url(url: str, timeout: int = 10) -> tuple[bool, str]:
         return False, f"request failed: {e}"
 
 
+def get_pdf_change_marker(url: str, timeout: int = 15) -> str | None:
+    """
+    Cheap way to detect whether a PDF at a stable URL (same URL, content
+    replaced in place periodically — e.g. JPMorgan's "latest weekly brief"
+    link) has actually changed, without downloading the whole file. Returns
+    an opaque marker to compare against a previously stored one, or None if
+    the server exposes neither ETag nor Last-Modified (caller should treat
+    that as "can't tell, skip this check").
+    """
+    try:
+        resp = requests.head(url, timeout=timeout, allow_redirects=True, headers=_HEADERS)
+        etag = resp.headers.get("ETag", "")
+        last_modified = resp.headers.get("Last-Modified", "")
+        if not etag and not last_modified:
+            return None
+        return f"{etag}|{last_modified}"
+    except requests.RequestException as e:
+        log.warning(f"get_pdf_change_marker: HEAD {url} failed: {e}")
+        return None
+
+
 def download_pdf(url: str, dest_path: Path, max_bytes: int = 2 * 1024 * 1024 * 1024,
                   timeout: int = 120) -> Path:
     """

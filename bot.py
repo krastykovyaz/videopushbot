@@ -12,6 +12,7 @@ import shutil
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import Callable
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, helpers as tl_helpers
@@ -22,7 +23,7 @@ import config_ru2
 from common.gemini_client import GeminiContentGenerator, append_footer
 from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
-from common.pdf_source import download_pdf, is_suitable_pdf_url
+from common.pdf_source import download_pdf, is_suitable_pdf_url, get_pdf_change_marker
 from common.vk_uploader import VKUploader
 from common.webpage_extract import (
     extract_webpage, find_article_links, find_ru_auto_links, extract_page_title,
@@ -73,6 +74,17 @@ PROCESSED_RU_AUTO_FILE = Path("processed_ru_auto_stories.json")
 # frequent enough to catch one within a few days of publication.
 QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS = 3 * 24 * 60 * 60
 PROCESSED_QUARTERLY_DIGEST_FILE = Path("processed_quarterly_digests.json")
+
+# Weekly JPMorgan Asset Management market brief: a stable URL whose PDF is
+# replaced in place each week (not a new URL per report like the other
+# sources), so dedup compares an ETag/Last-Modified marker instead of a URL.
+# Finance content, never automotive, so it always gets both ru+en videos.
+JPMORGAN_WEEKLY_BRIEF_URL = (
+    "https://am.jpmorgan.com/content/dam/jpm-am-aem/emea/regional/en/insights/"
+    "market-insights/the-weekly-brief/mi-weekly-market-brief-en.pdf"
+)
+JPMORGAN_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+PROCESSED_JPMORGAN_FILE = Path("processed_jpmorgan_brief.json")
 
 # Hard cap on how many videos actually get uploaded per channel per day —
 # protects against bursts (e.g. several auto-sources catching up on a
@@ -153,6 +165,19 @@ def _save_processed_quarterly_digest():
     PROCESSED_QUARTERLY_DIGEST_FILE.write_text(json.dumps(sorted(processed_quarterly_digest_urls), indent=2))
 
 
+def _load_processed_jpmorgan() -> dict:
+    if PROCESSED_JPMORGAN_FILE.exists():
+        try:
+            return json.loads(PROCESSED_JPMORGAN_FILE.read_text())
+        except Exception as e:
+            log.warning(f"processed_jpmorgan_brief.json: не удалось прочитать ({e}), начинаю с пустого")
+    return {"marker": None}
+
+
+def _save_processed_jpmorgan():
+    PROCESSED_JPMORGAN_FILE.write_text(json.dumps(processed_jpmorgan_state, indent=2))
+
+
 def _load_daily_publish_count() -> dict:
     if DAILY_PUBLISH_COUNT_FILE.exists():
         try:
@@ -203,14 +228,27 @@ def _save_deferred_publishes():
 processed_coindesk_urls = _load_processed_coindesk()
 processed_ru_auto_urls  = _load_processed_ru_auto()
 processed_quarterly_digest_urls = _load_processed_quarterly_digest()
+processed_jpmorgan_state = _load_processed_jpmorgan()   # {"marker": "<etag>|<last-modified>" | None}
 daily_publish_count = _load_daily_publish_count()   # {"YYYY-MM-DD": {"ru": N, "en": N}}
 deferred_publishes  = _load_deferred_publishes()    # [{chat_id, user_id, base_job_id, lang, category, video_path, thumb_path, vk_only}]
 
 # Dedup for an auto-source is only committed once its job actually renders
 # successfully (in on_job_done), not the moment it's enqueued — otherwise a
 # TTS/render failure marks the item "done" forever with no retry path.
-# base_job_id -> {"set": <processed_*_urls set>, "save_fn": <its _save_* fn>, "url": str}
-job_dedup_pending: dict[str, dict] = {}
+# base_job_id -> zero-arg callable that commits that source's dedup state
+# (add-to-set-and-save for URL-based sources, overwrite-and-save for a
+# single-slot source like JPMorgan's always-same-URL weekly brief).
+job_dedup_pending: dict[str, Callable[[], None]] = {}
+
+
+def _dedup_commit(item_set: set, item: str, save_fn: Callable[[], None]) -> Callable[[], None]:
+    """Binds item_set/item/save_fn as this call's own values (not a shared
+    loop variable) so a commit registered inside a loop — e.g. one per arxiv
+    paper — fires for the paper it was actually created for."""
+    def _commit():
+        item_set.add(item)
+        save_fn()
+    return _commit
 
 
 processed_arxiv_ids = _load_processed_arxiv()  # persists across restarts
@@ -518,10 +556,8 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
             await client.send_message(OWNER_ID, f"❌ Не удалось скачать {paper['pdf_url']}: {e}")
             continue
 
-        job_dedup_pending[job_id] = {
-            "set": processed_arxiv_ids[lang_key], "save_fn": _save_processed_arxiv,
-            "url": paper["arxiv_id"],
-        }
+        job_dedup_pending[job_id] = _dedup_commit(
+            processed_arxiv_ids[lang_key], paper["arxiv_id"], _save_processed_arxiv)
 
         await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
                            forced_langs=forced_langs, channel_description=channel_description)
@@ -638,9 +674,7 @@ async def _process_coindesk_article(url: str):
     job_category[job_id] = category
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = {
-        "set": processed_coindesk_urls, "save_fn": _save_processed_coindesk, "url": url,
-    }
+    job_dedup_pending[job_id] = _dedup_commit(processed_coindesk_urls, url, _save_processed_coindesk)
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, langs)
@@ -680,9 +714,7 @@ async def _process_ru_auto_story(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = {
-        "set": processed_ru_auto_urls, "save_fn": _save_processed_ru_auto, "url": url,
-    }
+    job_dedup_pending[job_id] = _dedup_commit(processed_ru_auto_urls, url, _save_processed_ru_auto)
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
@@ -730,9 +762,7 @@ async def _process_quarterly_digest(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = {
-        "set": processed_quarterly_digest_urls, "save_fn": _save_processed_quarterly_digest, "url": url,
-    }
+    job_dedup_pending[job_id] = _dedup_commit(processed_quarterly_digest_urls, url, _save_processed_quarterly_digest)
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
     await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
@@ -748,6 +778,41 @@ async def _check_quarterly_digest():
         except Exception as e:
             log.error(f"Квартальный обзор: проверка не удалась: {e}")
         await asyncio.sleep(QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS)
+
+
+# ── Еженедельный обзор рынка JPMorgan Asset Management ───────────────────────
+async def _process_jpmorgan_brief(marker: str):
+    job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_dir = WORKSPACE / str(OWNER_ID) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = job_dir / "input.pdf"
+
+    await client.send_message(OWNER_ID, "📈 Новый еженедельный обзор рынка JPMorgan, скачиваю...")
+    try:
+        await asyncio.to_thread(download_pdf, JPMORGAN_WEEKLY_BRIEF_URL, pdf_path)
+    except Exception as e:
+        await client.send_message(OWNER_ID, f"❌ Не удалось скачать JPMorgan brief: {e}")
+        return
+
+    def _commit():
+        processed_jpmorgan_state["marker"] = marker
+        _save_processed_jpmorgan()
+    job_dedup_pending[job_id] = _commit
+
+    # Self-classifies via process_pdf (should land on "GPMorgan report
+    # debates"), which also auto-splits ru+en since this is never automotive.
+    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir)
+
+
+async def _check_jpmorgan_weekly():
+    while True:
+        try:
+            marker = await asyncio.to_thread(get_pdf_change_marker, JPMORGAN_WEEKLY_BRIEF_URL)
+            if marker and marker != processed_jpmorgan_state.get("marker"):
+                await _process_jpmorgan_brief(marker)
+        except Exception as e:
+            log.error(f"JPMorgan: еженедельная проверка не удалась: {e}")
+        await asyncio.sleep(JPMORGAN_CHECK_INTERVAL_SECONDS)
 
 
 # ── Публикация (переиспользуется при обычном запуске и при /retry) ──────────
@@ -907,10 +972,9 @@ async def on_job_done(job: "Job", video_path, thumb_path, error):
 
     # Rendering succeeded — only now is it safe to mark the source item as
     # "done" so a render failure doesn't permanently skip it.
-    pending = job_dedup_pending.pop(base_job_id, None)
-    if pending:
-        pending["set"].add(pending["url"])
-        pending["save_fn"]()
+    commit_dedup = job_dedup_pending.pop(base_job_id, None)
+    if commit_dedup:
+        commit_dedup()
 
     category = job_category.get(base_job_id, "Other")
 
@@ -964,6 +1028,7 @@ async def main():
     asyncio.create_task(_check_coindesk_newsletters())
     asyncio.create_task(_check_ru_auto_daily())
     asyncio.create_task(_check_quarterly_digest())
+    asyncio.create_task(_check_jpmorgan_weekly())
     asyncio.create_task(_flush_deferred_publishes())
     await client.run_until_disconnected()
 
