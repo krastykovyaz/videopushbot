@@ -242,7 +242,10 @@ GEMINI_MODEL_CANDIDATES = [
     "gemini-3.7-flash",
     "gemini-2.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-2.5-pro",
+    # gemini-2.5-pro was dropped: it's now 404 for new users, and its
+    # suggested replacement (gemini-3.1-pro-preview) has zero free-tier
+    # quota on this API key (permanent 429, not transient) — only -flash
+    # tier models actually have free-tier access here.
 ]
 
 

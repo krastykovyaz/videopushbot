@@ -90,7 +90,7 @@ PROCESSED_JPMORGAN_FILE = Path("processed_jpmorgan_brief.json")
 # protects against bursts (e.g. several auto-sources catching up on a
 # backlog at once after downtime) flooding a channel in a short window.
 # Applies to every source, manual PDFs included.
-DAILY_VIDEO_CAP = 2
+DAILY_VIDEO_CAP = 3
 DAILY_PUBLISH_COUNT_FILE = Path("daily_publish_count.json")
 
 API_ID       = int(os.getenv("API_ID"))
