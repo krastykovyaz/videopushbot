@@ -1,244 +1,153 @@
-# Автоматические загрузчики видео
+# NotebookLM Clone — Telegram Userbot
 
-Два Python-скрипта для автоматической загрузки видео на различные платформы с мониторингом папок.
+Принимает PDF через Telegram, отдаёт:
+- 🎬 Видео MP4 ~7 минут (озвучка двух ведущих + картинки из статьи)
+- 🖼 Thumbnail PNG в стиле YouTube
 
-## 📦 Скрипты
+**Полностью бесплатно** при 3–5 видео/день.
 
-### 1. `upload_youtube_spotify_boosty_patreon.py`
-Загружает видео на **YouTube**, **Spotify Podcasters**, **Boosty** и **Patreon**
+---
 
-### 2. `upload_youtube_vk_rutube_boosty_patreon.py`
-Загружает видео на **YouTube**, **ВКонтакте**, **Rutube**, **Boosty** и **Patreon**
+## Быстрый старт
 
-## 🚀 Установка
+### 1. Получить Telegram API credentials
+Идти на https://my.telegram.org → "API development tools" → создать приложение.
+Скопировать `api_id` и `api_hash`.
 
-### Шаг 1: Установить Python
-Убедитесь, что у вас установлен Python 3.8 или новее:
+### 2. Получить Gemini API key (бесплатно)
+https://aistudio.google.com/app/apikey → "Create API key"
+
+### 3. Установить зависимости
+
 ```bash
-python --version
-```
+# Системные
+apt install ffmpeg   # Ubuntu/Debian
+# brew install ffmpeg  # macOS
 
-### Шаг 2: Установить зависимости
-```bash
+# Python
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
+# Если нет GPU — установить CPU-версию torch:
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 ```
 
-## ⚙️ Настройка
-
-### YouTube (для обоих скриптов)
-
-1. Перейдите в [Google Cloud Console](https://console.cloud.google.com/)
-2. Создайте новый проект
-3. Включите **YouTube Data API v3**
-4. Создайте OAuth 2.0 credentials
-5. Скачайте файл `client_secret.json` и поместите в папку со скриптом
-6. При первом запуске откроется браузер для авторизации
-
-### VK (для второго скрипта)
-
-1. Перейдите в [VK для разработчиков](https://vk.com/apps?act=manage)
-2. Создайте Standalone-приложение
-3. Получите токен доступа с правами: `video, offline`
-4. Вставьте токен в `CONFIG['vk']['access_token']`
-
-Для получения токена можно использовать:
-```python
-import vk_api
-
-vk_session = vk_api.VkApi('+71234567890', 'your_password')
-vk_session.auth()
-```
-
-### Rutube (для второго скрипта)
-
-1. Зарегистрируйтесь на [Rutube](https://rutube.ru/)
-2. Перейдите в [настройки API](https://rutube.ru/api/)
-3. Создайте приложение и получите:
-   - `client_id`
-   - `client_secret`
-   - `access_token`
-4. Вставьте данные в `CONFIG['rutube']`
-
-### Boosty (для обоих скриптов)
-
-1. Зайдите на [Boosty](https://boosty.to/)
-2. Войдите в свой аккаунт
-3. Получите токен доступа:
-   - Через DevTools (F12) → Application → Cookies → найдите 'auth'
-   - Или через официальное API (если доступно)
-4. Найдите имя вашего блога (из URL: `boosty.to/your_blog_name`)
-5. Вставьте в `CONFIG['boosty']`
-
-**Подробная инструкция:** см. файл `BOOSTY_PATREON_GUIDE.md`
-
-### Patreon (для обоих скриптов)
-
-1. Создайте приложение на [Patreon Portal](https://www.patreon.com/portal/registration/register-clients)
-2. Получите Client ID и Client Secret
-3. Получите Access Token через OAuth flow
-4. Получите Campaign ID через API
-5. Опционально: получите Tier IDs для ограничения доступа
-6. Вставьте в `CONFIG['patreon']`
-
-**⚠️ Важно:** Patreon не поддерживает прямую загрузку видео через API. Видео нужно загружать на YouTube (unlisted) и вставлять embed, или использовать внешний хостинг.
-
-**Подробная инструкция:** см. файл `BOOSTY_PATREON_GUIDE.md`
-
-### Spotify Podcasters (для первого скрипта)
-
-**Важно:** Spotify не предоставляет публичное API для загрузки видео. Варианты:
-
-1. **Anchor API** (если у вас есть доступ):
-   - Получите API ключ на anchor.fm
-   - Вставьте в `CONFIG['spotify']['api_key']`
-
-2. **Альтернатива**: Используйте автоматизацию браузера (Selenium)
-
-Или замените на другую платформу (TikTok, Telegram).
-
-## 📝 Использование
-
-### Запуск первого скрипта (YouTube + Spotify + Boosty + Patreon)
+### 4. Настроить .env
 
 ```bash
-python upload_youtube_spotify_boosty_patreon.py
+cp .env.example .env
+# Заполнить API_ID, API_HASH, PHONE_NUMBER, GEMINI_API_KEY
 ```
 
-### Запуск второго скрипта (YouTube + VK + Rutube + Boosty + Patreon)
+### 5. Запустить
 
 ```bash
-python upload_youtube_vk_rutube_boosty_patreon.py
+python bot.py
 ```
 
-### Структура файлов
+При первом запуске Telegram попросит ввести код из SMS — это нормально.
+После авторизации создастся файл `notebooklm_session.session` — не удалять.
 
-Положите видео и описание в папку для мониторинга:
+---
+
+## Структура проекта
 
 ```
-videos_to_upload/
-├── my_video.mp4          # Видеофайл
-└── my_video.txt          # Описание (опционально)
+notebooklm/
+├── bot.py                    # Telethon userbot, входная точка
+├── queue_worker.py           # Очередь задач (asyncio)
+├── pipeline/
+│   ├── step01_extract.py     # PDF → текст + картинки
+│   ├── step02_script.py      # LLM → скрипт диалога
+│   ├── step03_tts.py         # Chatterbox → WAV + timeline
+│   ├── step04_frames.py      # Pillow → PNG кадры 1920x1080
+│   ├── step05_video.py       # ffmpeg → MP4
+│   └── step06_thumbnail.py   # Pillow → thumbnail 1280x720
+├── workspace/                # Временные файлы (создаётся автоматически)
+│   └── {user_id}/{job_id}/
+│       ├── input.pdf
+│       ├── extracted/
+│       │   ├── text_blocks.json
+│       │   └── images/
+│       ├── script.json
+│       ├── audio/
+│       ├── frames/
+│       ├── timeline.json
+│       ├── final_audio.mp3
+│       ├── output_video.mp4
+│       └── thumbnail.png
+├── .env
+├── .env.example
+└── requirements.txt
 ```
 
-**Формат описания** (`my_video.txt`):
+---
+
+## Переменные окружения
+
+| Переменная | Описание | Пример |
+|---|---|---|
+| `API_ID` | Telegram API ID | `12345678` |
+| `API_HASH` | Telegram API Hash | `abc123...` |
+| `PHONE_NUMBER` | Твой номер телефона | `+79001234567` |
+| `GEMINI_API_KEY` | Google AI Studio key | `AIza...` |
+| `DEFAULT_LANG` | Язык по умолчанию | `ru` или `en` |
+| `MAX_WORKERS` | Параллельных задач | `1` (рекомендуется) |
+| `ALLOWED_USERS` | Telegram user_id через запятую | пусто = все |
+| `VOICE_HOST1_REF` | Путь к WAV для клонирования голоса Host1 | `voices/host1.wav` |
+| `VOICE_HOST2_REF` | Путь к WAV для клонирования голоса Host2 | `voices/host2.wav` |
+| `WORKSPACE_DIR` | Папка для временных файлов | `./workspace` |
+
+---
+
+## Команды в Telegram
+
+| Команда | Действие |
+|---|---|
+| `/start` или `/help` | Приветствие и инструкция |
+| `/lang ru` | Установить русский язык |
+| `/lang en` | Установить английский язык |
+| `/status` | Позиция в очереди |
+| Отправить PDF | Запустить генерацию |
+
+---
+
+## Клонирование голоса (опционально)
+
+Chatterbox поддерживает zero-shot voice cloning.
+Положи 5–10 секунд чистой речи в WAV (16kHz моно) в папку `voices/`
+и укажи путь в `.env`:
+
 ```
-Это описание моего видео.
-Может быть многострочным.
-
-Поддерживаются переносы строк.
-```
-
-**Поддерживаемые форматы видео:**
-- `.mp4` (рекомендуется)
-- `.mov`
-- `.avi`
-- `.mkv`
-- `.flv`
-
-## 🔧 Настройка конфигурации
-
-Отредактируйте раздел `CONFIG` в начале каждого скрипта:
-
-```python
-CONFIG = {
-    'watch_folder': './videos_to_upload',      # Папка для мониторинга
-    'processed_folder': './processed_videos',   # Папка для обработанных
-    
-    'youtube': {
-        'privacy_status': 'private',  # 'public', 'private', 'unlisted'
-        'category_id': '22',          # Категория видео
-    },
-    
-    'max_retries': 3,      # Количество попыток при ошибке
-    'retry_delay': 60,     # Задержка между попытками (секунды)
-}
-```
-
-## 📊 Логирование
-
-Скрипты создают файлы логов:
-- `upload_log.txt` - для первого скрипта
-- `upload_log_vk_rutube.txt` - для второго скрипта
-
-Результаты загрузки сохраняются в:
-- `upload_results.json` - для первого скрипта
-- `upload_results_ru.json` - для второго скрипта
-
-## 🛠️ Устранение неполадок
-
-### YouTube: "The request cannot be completed"
-- Убедитесь, что YouTube Data API v3 включено
-- Проверьте квоты API в Google Cloud Console
-
-### VK: "Access denied"
-- Проверьте права токена: `video, offline`
-- Убедитесь, что токен не истек
-
-### Rutube: 401 Unauthorized
-- Обновите access token
-- Проверьте правильность client_id и client_secret
-
-### Файлы не загружаются
-- Убедитесь, что файлы полностью скопированы (скрипт ждет 5 секунд)
-- Проверьте формат видео (должен быть в списке поддерживаемых)
-- Посмотрите логи для деталей ошибки
-
-## 📋 Дополнительные функции
-
-### Автозапуск при загрузке системы (Linux)
-
-Создайте systemd service:
-```bash
-sudo nano /etc/systemd/system/video-uploader.service
+VOICE_HOST1_REF=voices/host1.wav
+VOICE_HOST2_REF=voices/host2.wav
 ```
 
-Содержимое:
-```ini
-[Unit]
-Description=Video Auto Uploader
-After=network.target
+---
 
-[Service]
-Type=simple
-User=your_username
-WorkingDirectory=/path/to/scripts
-ExecStart=/usr/bin/python3 /path/to/scripts/upload_youtube_vk_rutube.py
-Restart=always
+## Советы по производительности
 
-[Install]
-WantedBy=multi-user.target
-```
+**Без GPU (CPU):**
+- Генерация 7 мин аудио ≈ 5–10 минут
+- MAX_WORKERS=1 обязательно
 
-Активировать:
-```bash
-sudo systemctl enable video-uploader.service
-sudo systemctl start video-uploader.service
-```
+**С GPU (NVIDIA):**
+- Генерация 7 мин аудио ≈ 30–60 секунд
+- Можно попробовать MAX_WORKERS=2
 
-### Автозапуск (Windows)
+**Google Colab (бесплатный GPU T4):**
+- Запустить bot.py в Colab с ngrok или просто как скрипт
+- Tesla T4 ускоряет TTS в ~10 раз по сравнению с CPU
 
-Используйте Task Scheduler для запуска скрипта при входе в систему.
+---
 
-## 📄 Лицензия
+## Стоимость (3–5 видео/день)
 
-MIT License - свободно используйте и модифицируйте под свои нужды.
-
-## 📚 Дополнительные файлы
-
-- **BOOSTY_PATREON_GUIDE.md** - Подробное руководство по настройке Boosty и Patreon
-- **quick_start_guide.txt** - Краткая инструкция по быстрому старту
-- **config_example.json** - Пример файла конфигурации
-
-## 🤝 Поддержка
-
-При возникновении проблем:
-1. Проверьте логи
-2. Убедитесь, что все токены и ключи API актуальны
-3. Проверьте квоты API платформ
-
-## ⚠️ Важные замечания
-
-- **Квоты YouTube API:** 10,000 единиц в день (одна загрузка = ~1600 единиц)
-- **Ограничения VK:** Зависят от типа аккаунта
-- **Rutube:** Проверяйте лимиты на загрузку
-- Храните токены и ключи в безопасности (не публикуйте в Git)
+| Компонент | Инструмент | Стоимость |
+|---|---|---|
+| LLM (скрипт) | Gemini 2.5 Flash free tier | $0 |
+| TTS | Chatterbox (локально) | $0 |
+| Видео рендер | ffmpeg | $0 |
+| Изображения | Из самого PDF | $0 |
+| **Итого** | | **$0/мес** |

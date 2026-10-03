@@ -27,8 +27,10 @@ def build_video(frames_dir: Path, timeline: list[dict], job_dir: Path) -> Path:
     concat_path = job_dir / "concat.txt"
     _write_concat(timeline, frames_dir, concat_path)
 
-    # Запустить ffmpeg
-    _run_ffmpeg(concat_path, audio_path, output_path)
+    # A fixed 600s limit killed long renders on a small server (-preset slow at
+    # 1080p); allow ~3x the audio length, never less than 10 minutes.
+    total_sec = sum(e["duration_ms"] for e in timeline) / 1000.0
+    _run_ffmpeg(concat_path, audio_path, output_path, timeout=max(600, int(total_sec * 3)))
 
     size_mb = output_path.stat().st_size / 1024 / 1024
     log.info(f"Видео готово: {size_mb:.1f} МБ → {output_path}")
@@ -40,12 +42,21 @@ def _write_concat(timeline: list[dict], frames_dir: Path, concat_path: Path):
     lines = []
     valid_entries = []
 
+    previous = None
     for entry in timeline:
-        frame = frames_dir / f"frame_{entry['seg_id']:04d}.png"
+        frame = Path(entry.get("frame_path") or frames_dir / f"frame_{entry['seg_id']:04d}.png")
         if not frame.exists():
-            log.warning(f"Кадр не найден: {frame}, пропускаю")
-            continue
+            # Skipping the frame (old behaviour) shifted every later slide earlier
+            # than its audio. Hold the previous slide for this segment's duration.
+            if previous is None:
+                log.warning(f"Кадр не найден: {frame}, пропускаю (нет предыдущего кадра)")
+                continue
+            log.warning(f"Кадр не найден: {frame}, показываю предыдущий кадр")
+            frame = previous
+        previous = frame
         valid_entries.append((frame, entry))
+    if not valid_entries:
+        raise RuntimeError(f"Нет ни одного кадра в {frames_dir}")
 
     for i, (frame, entry) in enumerate(valid_entries):
         duration_sec = entry["duration_ms"] / 1000.0 + 0.3
@@ -63,7 +74,7 @@ def _write_concat(timeline: list[dict], frames_dir: Path, concat_path: Path):
     log.info(f"Concat файл: {len(valid_entries)} кадров → {concat_path}")
 
 
-def _run_ffmpeg(concat_path: Path, audio_path: Path, output_path: Path):
+def _run_ffmpeg(concat_path: Path, audio_path: Path, output_path: Path, timeout: int = 600):
     """Запустить ffmpeg для сборки видео."""
     cmd = [
         "ffmpeg", "-y",
@@ -100,7 +111,7 @@ def _run_ffmpeg(concat_path: Path, audio_path: Path, output_path: Path):
         cmd,
         capture_output=True,
         text=True,
-        timeout=600,  # 10 минут максимум
+        timeout=timeout,
     )
 
     if result.returncode != 0:

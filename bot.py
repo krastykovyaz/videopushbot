@@ -8,11 +8,14 @@ import asyncio
 import json
 import os
 import re
+import hashlib
 import shutil
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Callable
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, helpers as tl_helpers
@@ -93,7 +96,7 @@ PROCESSED_JPMORGAN_FILE = Path("processed_jpmorgan_brief.json")
 DAILY_VIDEO_CAP = 3
 DAILY_PUBLISH_COUNT_FILE = Path("daily_publish_count.json")
 
-API_ID       = int(os.getenv("API_ID"))
+API_ID       = int(config_ru2._required("API_ID"))
 API_HASH     = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 WORKSPACE    = Path(os.getenv("WORKSPACE_DIR", "./workspace"))
@@ -109,6 +112,15 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 client    = TelegramClient("notebooklm_session", API_ID, API_HASH)
 job_queue = JobQueue(max_workers=MAX_WORKERS)
 
+def _atomic_write(path: Path, text: str):
+    """Write-then-rename: a crash or full disk mid-write must not leave a
+    truncated state file, which the loaders would silently treat as empty
+    (losing the deferred backlog, or re-processing already-published items)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def _load_processed_arxiv() -> dict:
     if PROCESSED_ARXIV_FILE.exists():
         try:
@@ -120,7 +132,7 @@ def _load_processed_arxiv() -> dict:
 
 
 def _save_processed_arxiv():
-    PROCESSED_ARXIV_FILE.write_text(json.dumps({
+    _atomic_write(PROCESSED_ARXIV_FILE, json.dumps({
         "en": sorted(processed_arxiv_ids["en"]),
         "ru": sorted(processed_arxiv_ids["ru"]),
     }, indent=2))
@@ -136,7 +148,7 @@ def _load_processed_coindesk() -> set:
 
 
 def _save_processed_coindesk():
-    PROCESSED_COINDESK_FILE.write_text(json.dumps(sorted(processed_coindesk_urls), indent=2))
+    _atomic_write(PROCESSED_COINDESK_FILE, json.dumps(sorted(processed_coindesk_urls), indent=2))
 
 
 def _load_processed_ru_auto() -> set:
@@ -149,7 +161,7 @@ def _load_processed_ru_auto() -> set:
 
 
 def _save_processed_ru_auto():
-    PROCESSED_RU_AUTO_FILE.write_text(json.dumps(sorted(processed_ru_auto_urls), indent=2))
+    _atomic_write(PROCESSED_RU_AUTO_FILE, json.dumps(sorted(processed_ru_auto_urls), indent=2))
 
 
 def _load_processed_quarterly_digest() -> set:
@@ -162,7 +174,7 @@ def _load_processed_quarterly_digest() -> set:
 
 
 def _save_processed_quarterly_digest():
-    PROCESSED_QUARTERLY_DIGEST_FILE.write_text(json.dumps(sorted(processed_quarterly_digest_urls), indent=2))
+    _atomic_write(PROCESSED_QUARTERLY_DIGEST_FILE, json.dumps(sorted(processed_quarterly_digest_urls), indent=2))
 
 
 def _load_processed_jpmorgan() -> dict:
@@ -171,11 +183,11 @@ def _load_processed_jpmorgan() -> dict:
             return json.loads(PROCESSED_JPMORGAN_FILE.read_text())
         except Exception as e:
             log.warning(f"processed_jpmorgan_brief.json: не удалось прочитать ({e}), начинаю с пустого")
-    return {"marker": None}
+    return {"marker": None, "sha256": None}
 
 
 def _save_processed_jpmorgan():
-    PROCESSED_JPMORGAN_FILE.write_text(json.dumps(processed_jpmorgan_state, indent=2))
+    _atomic_write(PROCESSED_JPMORGAN_FILE, json.dumps(processed_jpmorgan_state, indent=2))
 
 
 def _load_daily_publish_count() -> dict:
@@ -188,7 +200,7 @@ def _load_daily_publish_count() -> dict:
 
 
 def _save_daily_publish_count():
-    DAILY_PUBLISH_COUNT_FILE.write_text(json.dumps(daily_publish_count, indent=2))
+    _atomic_write(DAILY_PUBLISH_COUNT_FILE, json.dumps(daily_publish_count, indent=2))
 
 
 def _today_key() -> str:
@@ -202,6 +214,8 @@ def _publishes_today(lang: str) -> int:
 def _record_publish(lang: str):
     day = daily_publish_count.setdefault(_today_key(), {})
     day[lang] = day.get(lang, 0) + 1
+    for old_key in sorted(daily_publish_count)[:-30]:
+        del daily_publish_count[old_key]
     _save_daily_publish_count()
 
 
@@ -222,9 +236,35 @@ def _load_deferred_publishes() -> list:
 
 
 def _save_deferred_publishes():
-    DEFERRED_PUBLISH_FILE.write_text(json.dumps(deferred_publishes, indent=2))
+    _atomic_write(DEFERRED_PUBLISH_FILE, json.dumps(deferred_publishes, indent=2))
 
 
+# When each periodic checker last ran. Without this every restart/deploy ran
+# all of them immediately, so each restart produced an extra "story of the day".
+CHECKER_STATE_FILE = Path("checker_last_run.json")
+
+
+def _load_checker_state() -> dict:
+    if CHECKER_STATE_FILE.exists():
+        try:
+            return json.loads(CHECKER_STATE_FILE.read_text())
+        except Exception as e:
+            log.warning(f"checker_last_run.json: не удалось прочитать ({e}), начинаю с пустого")
+    return {}
+
+
+async def _wait_until_due(name: str, interval: int):
+    remaining = interval - (time.time() - checker_last_run.get(name, 0))
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+def _mark_checked(name: str):
+    checker_last_run[name] = time.time()
+    _atomic_write(CHECKER_STATE_FILE, json.dumps(checker_last_run, indent=2))
+
+
+checker_last_run = _load_checker_state()
 processed_coindesk_urls = _load_processed_coindesk()
 processed_ru_auto_urls  = _load_processed_ru_auto()
 processed_quarterly_digest_urls = _load_processed_quarterly_digest()
@@ -239,6 +279,31 @@ deferred_publishes  = _load_deferred_publishes()    # [{chat_id, user_id, base_j
 # (add-to-set-and-save for URL-based sources, overwrite-and-save for a
 # single-slot source like JPMorgan's always-same-URL weekly brief).
 job_dedup_pending: dict[str, Callable[[], None]] = {}
+# Source items whose job is queued or rendering. Dedup is only committed after
+# a successful render, so without this a checker that fires again while the
+# job is still in the queue would enqueue the same article a second time.
+in_flight_items: set[str] = set()
+job_in_flight: dict[str, str] = {}     # base_job_id -> its source item
+job_langs_left: dict[str, int] = {}    # base_job_id -> languages still queued/rendering
+
+
+def _track_source_item(job_id: str, item: str, commit: Callable[[], None]):
+    job_dedup_pending[job_id] = commit
+    job_in_flight[job_id] = item
+    in_flight_items.add(item)
+
+
+def _untrack_job(job_id: str):
+    """Forget a job's bookkeeping once all its languages are done (or it never
+    got queued). An uncommitted dedup entry is dropped on purpose: if every
+    language failed, the item must stay eligible for the next check."""
+    job_langs_left.pop(job_id, None)
+    job_dedup_pending.pop(job_id, None)
+    item = job_in_flight.pop(job_id, None)
+    if item:
+        in_flight_items.discard(item)
+    job_category.pop(job_id, None)
+    job_channel_description.pop(job_id, None)
 
 
 def _dedup_commit(item_set: set, item: str, save_fn: Callable[[], None]) -> Callable[[], None]:
@@ -273,7 +338,7 @@ gemini_en = GeminiContentGenerator(config_en.CONFIG["gemini"]["api_key"], config
 
 yt_ru = yt_en = vk_uploader = None
 
-if config_ru2.CONFIG["youtube"]["auto_upload"] and os.path.exists(config_ru2.CONFIG["youtube"]["client_secrets_file"]):
+if config_ru2.CONFIG["youtube"]["auto_upload"] and os.path.exists(config_ru2.CONFIG["youtube"]["client_secrets_file"] or ""):
     try:
         yt_ru = YouTubeUploader(
             config_ru2.CONFIG["youtube"]["client_secrets_file"],
@@ -285,7 +350,7 @@ if config_ru2.CONFIG["youtube"]["auto_upload"] and os.path.exists(config_ru2.CON
     except Exception as e:
         log.warning(f"⚠️ YouTube RU uploader не инициализирован: {e}")
 
-if config_en.CONFIG["youtube"]["auto_upload"] and os.path.exists(config_en.CONFIG["youtube"]["client_secrets_file"]):
+if config_en.CONFIG["youtube"]["auto_upload"] and os.path.exists(config_en.CONFIG["youtube"]["client_secrets_file"] or ""):
     try:
         yt_en = YouTubeUploader(
             config_en.CONFIG["youtube"]["client_secrets_file"],
@@ -470,6 +535,21 @@ def _arxiv_id(url: str) -> str:
     return m.group(1) if m else url
 
 
+_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+
+
+def _arxiv_link_kind(url: str) -> str | None:
+    """'abs' / 'pdf' for a genuine arxiv.org link, else None."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in _ARXIV_HOSTS:
+        return None
+    if parsed.path.startswith("/abs/"):
+        return "abs"
+    if parsed.path.startswith("/pdf/"):
+        return "pdf"
+    return None
+
+
 def _extract_papers(event) -> list[dict]:
     """
     Returns one {title, pdf_url, arxiv_id} entry per paper in the post — a
@@ -491,10 +571,11 @@ def _extract_papers(event) -> list[dict]:
         url = getattr(entity, "url", None)
         if not url:
             continue
-        if "arxiv.org/abs/" in url:
+        kind = _arxiv_link_kind(url)
+        if kind == "abs":
             pending_title = tl_helpers.del_surrogate(raw[entity.offset:entity.offset + entity.length])
             pending_id = _arxiv_id(url)
-        elif "arxiv.org/pdf/" in url and pending_title and _arxiv_id(url) == pending_id:
+        elif kind == "pdf" and pending_title and _arxiv_id(url) == pending_id:
             papers.append({"title": pending_title, "pdf_url": url, "arxiv_id": pending_id})
             pending_title = pending_id = None
     return papers
@@ -528,7 +609,8 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
         return
 
     for paper in papers:
-        if paper["arxiv_id"] in processed_arxiv_ids[lang_key]:
+        item = f"arxiv:{lang_key}:{paper['arxiv_id']}"
+        if paper["arxiv_id"] in processed_arxiv_ids[lang_key] or item in in_flight_items:
             log.info(f"@{channel_name}: {paper['arxiv_id']} уже обработан для {lang_key}, пропускаю")
             continue
 
@@ -556,11 +638,19 @@ async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: li
             await client.send_message(OWNER_ID, f"❌ Не удалось скачать {paper['pdf_url']}: {e}")
             continue
 
-        job_dedup_pending[job_id] = _dedup_commit(
-            processed_arxiv_ids[lang_key], paper["arxiv_id"], _save_processed_arxiv)
+        _track_source_item(job_id, item, _dedup_commit(
+            processed_arxiv_ids[lang_key], paper["arxiv_id"], _save_processed_arxiv))
 
-        await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
-                           forced_langs=forced_langs, channel_description=channel_description)
+        # A channel post is a one-off live event: if one paper of a digest
+        # fails here, the remaining papers must still be processed.
+        try:
+            await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir,
+                               forced_langs=forced_langs, channel_description=channel_description)
+        except Exception as e:
+            log.exception(f"@{channel_name}: {paper['arxiv_id']} не удалось поставить в очередь")
+            if job_id not in job_langs_left:
+                _untrack_job(job_id)
+            await client.send_message(OWNER_ID, f"❌ {paper['title']}: {e}")
 
 
 # ── Общая обработка PDF (ручная отправка + каналы) ───────────────────────────
@@ -594,7 +684,7 @@ async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path,
 async def _enqueue_langs(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path, langs: list):
     for lang in langs:
         lang_dir = job_dir / lang
-        lang_dir.mkdir(exist_ok=True)
+        lang_dir.mkdir(parents=True, exist_ok=True)
         lang_pdf = lang_dir / "input.pdf"
         await asyncio.to_thread(shutil.copy2, pdf_path, lang_pdf)
 
@@ -615,6 +705,7 @@ async def _enqueue_langs(chat_id: int, user_id: int, pdf_path: Path, job_dir: Pa
             lang=lang,
             progress_fn=make_progress_tracker(chat_id),
         )
+        job_langs_left[job_dir.name] = job_langs_left.get(job_dir.name, 0) + 1
         await job_queue.enqueue(job)
 
 
@@ -622,9 +713,12 @@ async def _enqueue_langs_webpage(chat_id: int, user_id: int, blocks: list, job_d
     """Same as _enqueue_langs, but for a webpage source: no PDF to copy per
     language, the already-extracted blocks (text+images) are shared as-is —
     run_pipeline skips its own extraction step when pre_extracted_blocks is set."""
+    # /retry re-renders from last_pdf; a webpage job has no PDF, so a stale
+    # entry from an older PDF job must not be re-rendered in its place.
+    last_pdf.pop(user_id, None)
     for lang in langs:
         lang_dir = job_dir / lang
-        lang_dir.mkdir(exist_ok=True)
+        lang_dir.mkdir(parents=True, exist_ok=True)
 
         pos  = job_queue.queue_size() + 1
         flag = "🇷🇺" if lang == "ru" else "🇺🇸"
@@ -644,12 +738,24 @@ async def _enqueue_langs_webpage(chat_id: int, user_id: int, blocks: list, job_d
             progress_fn=make_progress_tracker(chat_id),
             pre_extracted_blocks=blocks,
         )
+        job_langs_left[job_dir.name] = job_langs_left.get(job_dir.name, 0) + 1
         await job_queue.enqueue(job)
+
+
+async def _enqueue_tracked_webpage(job_id: str, blocks: list, job_dir: Path, langs: list):
+    """Queues a webpage job; if queuing itself fails, the source item must not
+    stay marked "in flight" forever."""
+    try:
+        await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, langs)
+    except Exception:
+        if job_id not in job_langs_left:
+            _untrack_job(job_id)
+        raise
 
 
 # ── Ежедневная проверка крипто-рассылок CoinDesk ─────────────────────────────
 async def _process_coindesk_article(url: str):
-    if url in processed_coindesk_urls:
+    if url in processed_coindesk_urls or url in in_flight_items:
         return
 
     job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -674,14 +780,15 @@ async def _process_coindesk_article(url: str):
     job_category[job_id] = category
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = _dedup_commit(processed_coindesk_urls, url, _save_processed_coindesk)
+    _track_source_item(job_id, url, _dedup_commit(processed_coindesk_urls, url, _save_processed_coindesk))
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{category}» → {'/'.join(l.upper() for l in langs)}")
-    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, langs)
+    await _enqueue_tracked_webpage(job_id, blocks, job_dir, langs)
 
 
 async def _check_coindesk_newsletters():
     while True:
+        await _wait_until_due("coindesk", COINDESK_CHECK_INTERVAL_SECONDS)
         for newsletter_url in COINDESK_NEWSLETTERS:
             try:
                 links = await asyncio.to_thread(find_article_links, newsletter_url, 5)
@@ -690,12 +797,12 @@ async def _check_coindesk_newsletters():
                         await _process_coindesk_article(link)
             except Exception as e:
                 log.error(f"CoinDesk: проверка {newsletter_url} не удалась: {e}")
-        await asyncio.sleep(COINDESK_CHECK_INTERVAL_SECONDS)
+        _mark_checked("coindesk")
 
 
 # ── Ежедневный выбор одного авто-сюжета (за рулем / kolesa.ru / autonews.ru) ─
 async def _process_ru_auto_story(url: str, title: str):
-    if url in processed_ru_auto_urls:
+    if url in processed_ru_auto_urls or url in in_flight_items:
         return
 
     job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -714,17 +821,19 @@ async def _process_ru_auto_story(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = _dedup_commit(processed_ru_auto_urls, url, _save_processed_ru_auto)
+    _track_source_item(job_id, url, _dedup_commit(processed_ru_auto_urls, url, _save_processed_ru_auto))
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
-    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
+    await _enqueue_tracked_webpage(job_id, blocks, job_dir, ["ru"])
 
 
 async def _check_ru_auto_daily():
     while True:
+        await _wait_until_due("ru_auto", RU_AUTO_CHECK_INTERVAL_SECONDS)
         try:
             links = await asyncio.to_thread(find_ru_auto_links, 5)
-            new_links = [l for l in links if l not in processed_ru_auto_urls]
+            new_links = [l for l in links if l not in processed_ru_auto_urls
+                         and l not in processed_quarterly_digest_urls and l not in in_flight_items]
 
             candidates = []
             for url in new_links:
@@ -740,12 +849,12 @@ async def _check_ru_auto_daily():
                 await _process_ru_auto_story(chosen["url"], chosen["title"])
         except Exception as e:
             log.error(f"RU auto: ежедневная проверка не удалась: {e}")
-        await asyncio.sleep(RU_AUTO_CHECK_INTERVAL_SECONDS)
+        _mark_checked("ru_auto")
 
 
 # ── Квартальный обзор импорта авто по всем странам-партнёрам ─────────────────
 async def _process_quarterly_digest(url: str, title: str):
-    if url in processed_quarterly_digest_urls:
+    if url in processed_quarterly_digest_urls or url in in_flight_items:
         return
 
     job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -762,22 +871,24 @@ async def _process_quarterly_digest(url: str, title: str):
     job_category[job_id] = AUTOMOTIVE_CATEGORY
     last_base_job_id[OWNER_ID] = job_id
 
-    job_dedup_pending[job_id] = _dedup_commit(processed_quarterly_digest_urls, url, _save_processed_quarterly_digest)
+    _track_source_item(job_id, url, _dedup_commit(
+        processed_quarterly_digest_urls, url, _save_processed_quarterly_digest))
 
     await client.send_message(OWNER_ID, f"🏷 Тема: «{AUTOMOTIVE_CATEGORY}» → RU")
-    await _enqueue_langs_webpage(OWNER_ID, OWNER_ID, blocks, job_dir, ["ru"])
+    await _enqueue_tracked_webpage(job_id, blocks, job_dir, ["ru"])
 
 
 async def _check_quarterly_digest():
     while True:
+        await _wait_until_due("quarterly_digest", QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS)
         try:
             candidates = await asyncio.to_thread(find_quarterly_digest_candidates, 20)
             for c in candidates:
-                if c["url"] not in processed_quarterly_digest_urls:
+                if c["url"] not in processed_quarterly_digest_urls and c["url"] not in processed_ru_auto_urls:
                     await _process_quarterly_digest(c["url"], c["title"])
         except Exception as e:
             log.error(f"Квартальный обзор: проверка не удалась: {e}")
-        await asyncio.sleep(QUARTERLY_DIGEST_CHECK_INTERVAL_SECONDS)
+        _mark_checked("quarterly_digest")
 
 
 # ── Еженедельный обзор рынка JPMorgan Asset Management ───────────────────────
@@ -787,39 +898,65 @@ async def _process_jpmorgan_brief(marker: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = job_dir / "input.pdf"
 
-    await client.send_message(OWNER_ID, "📈 Новый еженедельный обзор рынка JPMorgan, скачиваю...")
     try:
         await asyncio.to_thread(download_pdf, JPMORGAN_WEEKLY_BRIEF_URL, pdf_path)
     except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
         await client.send_message(OWNER_ID, f"❌ Не удалось скачать JPMorgan brief: {e}")
         return
 
-    def _commit():
+    # The HEAD marker only says "maybe changed" (headers can change without
+    # the PDF changing, and the file can be replaced between HEAD and GET);
+    # the hash of what was actually downloaded is what identifies a brief.
+    digest = await asyncio.to_thread(lambda: hashlib.sha256(pdf_path.read_bytes()).hexdigest())
+    if digest == processed_jpmorgan_state.get("sha256"):
         processed_jpmorgan_state["marker"] = marker
         _save_processed_jpmorgan()
-    job_dedup_pending[job_id] = _commit
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    await client.send_message(OWNER_ID, "📈 Новый еженедельный обзор рынка JPMorgan")
+
+    def _commit():
+        processed_jpmorgan_state["marker"] = marker
+        processed_jpmorgan_state["sha256"] = digest
+        _save_processed_jpmorgan()
+    _track_source_item(job_id, JPMORGAN_WEEKLY_BRIEF_URL, _commit)
 
     # Self-classifies via process_pdf (should land on "GPMorgan report
     # debates"), which also auto-splits ru+en since this is never automotive.
-    await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir)
+    try:
+        await process_pdf(OWNER_ID, OWNER_ID, pdf_path, job_dir)
+    except Exception:
+        if job_id not in job_langs_left:
+            _untrack_job(job_id)
+        raise
 
 
 async def _check_jpmorgan_weekly():
     while True:
+        await _wait_until_due("jpmorgan", JPMORGAN_CHECK_INTERVAL_SECONDS)
         try:
             marker = await asyncio.to_thread(get_pdf_change_marker, JPMORGAN_WEEKLY_BRIEF_URL)
-            if marker and marker != processed_jpmorgan_state.get("marker"):
+            if (marker and marker != processed_jpmorgan_state.get("marker")
+                    and JPMORGAN_WEEKLY_BRIEF_URL not in in_flight_items):
                 await _process_jpmorgan_brief(marker)
         except Exception as e:
             log.error(f"JPMorgan: еженедельная проверка не удалась: {e}")
-        await asyncio.sleep(JPMORGAN_CHECK_INTERVAL_SECONDS)
+        _mark_checked("jpmorgan")
 
 
 # ── Публикация (переиспользуется при обычном запуске и при /retry) ──────────
 async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, category: str,
-                    video_path: Path, thumb_path: Path, vk_only: bool = False, force: bool = False):
+                    video_path: Path, thumb_path: Path, vk_only: bool = False, force: bool = False,
+                    quiet_unless_uploaded: bool = False):
+    """Returns False only if something was held back by the daily cap.
+    quiet_unless_uploaded: used by the background retry loop, which calls this
+    repeatedly — it must not post "limit reached"/"upload failed" every time."""
     flag = "🇷🇺" if lang == "ru" else "🇺🇸"
 
+    while len(last_result) > 200:          # oldest first; only recent entries are ever read
+        last_result.pop(next(iter(last_result)))
     entry = last_result.setdefault(f"{base_job_id}:{lang}", {
         "video_path": None, "thumb_path": None, "title": None, "description": None,
         "category": None, "youtube": None, "vk": None,
@@ -870,7 +1007,7 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
                 did_new_upload = True
                 lines.append(f"▶️ YouTube: {youtube_url}")
             else:
-                lines.append(f"⚠️ YouTube: {yt_result.get('error')}")
+                lines.append(f"⚠️ YouTube: {yt_result.get('error')} — повторю автоматически")
         elif yt:
             lines.append(f"⚠️ YouTube {lang.upper()} не авторизован — используй /youtube_auth {lang}")
         else:
@@ -891,10 +1028,14 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
                 did_new_upload = True
                 lines.append(f"📹 VK: {vk_result['url']}")
             else:
-                lines.append(f"⚠️ VK: {vk_result.get('error')}")
+                lines.append(f"⚠️ VK: {vk_result.get('error')} — повторю автоматически")
 
-    if did_new_upload:
+    if did_new_upload and not entry.get("counted"):
+        entry["counted"] = True
         _record_publish(lang)
+
+    if quiet_unless_uploaded and not did_new_upload:
+        return not deferred
 
     await client.send_file(
         chat_id,
@@ -920,7 +1061,7 @@ async def _handle_retry(event, user_id: int, target: str):
 
     if target == "vk":
         entry = last_result.get(f"{base_job_id}:ru") if base_job_id else None
-        if not entry or not entry.get("video_path"):
+        if not entry or not entry.get("video_path") or not Path(entry["video_path"]).exists():
             await event.reply("⚠️ Нет готового RU-видео для повторной публикации в VK. Отправь PDF заново.")
             return
         await event.reply("🔁 Повторяю публикацию в VK (в обход дневного лимита)...")
@@ -930,7 +1071,7 @@ async def _handle_retry(event, user_id: int, target: str):
 
     lang = target
     entry = last_result.get(f"{base_job_id}:{lang}") if base_job_id else None
-    if entry and entry.get("video_path"):
+    if entry and entry.get("video_path") and Path(entry["video_path"]).exists():
         await event.reply(f"🔁 [{lang.upper()}] Видео уже готово, повторяю публикацию (в обход дневного лимита)...")
         await _publish(event.chat_id, user_id, base_job_id, lang, entry["category"],
                         entry["video_path"], entry["thumb_path"], force=True)
@@ -940,21 +1081,50 @@ async def _handle_retry(event, user_id: int, target: str):
         await event.reply("⚠️ Нет сохранённого PDF для повтора. Отправь файл заново.")
         return
     pdf_path, job_dir, category = last_pdf[user_id]
+    if not Path(pdf_path).exists():
+        await event.reply("⚠️ Исходный PDF уже удалён (видео опубликовано или истёк срок хранения). Отправь файл заново.")
+        return
     job_category[job_dir.name] = category
     await event.reply(f"🔁 [{lang.upper()}] Начинаю обработку заново...")
     await _enqueue_langs(event.chat_id, user_id, pdf_path, job_dir, [lang])
 
 
 # ── Колбэк завершения задачи ─────────────────────────────────────────────────
+DEFERRED_RETRY_MAX_BACKOFF_SECONDS = 6 * 60 * 60
+
+
+def _sync_deferred_results(entry: dict):
+    """Persist per-destination successes in the queue entry itself: last_result
+    lives only in memory, so after a restart a half-published video (YouTube
+    done, VK failed) would otherwise be uploaded to YouTube a second time."""
+    res = last_result.get(f"{entry['base_job_id']}:{entry['lang']}") or {}
+    for dest in ("youtube", "vk"):
+        if res.get(dest) and res[dest].get("success"):
+            entry[dest] = res[dest]
+
+
+def _seed_last_result(entry: dict):
+    res = last_result.setdefault(f"{entry['base_job_id']}:{entry['lang']}", {
+        "video_path": None, "thumb_path": None, "title": None, "description": None,
+        "category": None, "youtube": None, "vk": None,
+    })
+    for dest in ("youtube", "vk"):
+        if entry.get(dest) and not res.get(dest):
+            res[dest] = entry[dest]
+            res["counted"] = True
+
+
 def _register_deferred(chat_id, user_id, base_job_id, lang, category, video_path, thumb_path, vk_only):
     key = f"{base_job_id}:{lang}:{vk_only}"
     if any(f"{d['base_job_id']}:{d['lang']}:{d['vk_only']}" == key for d in deferred_publishes):
         return
-    deferred_publishes.append({
+    entry = {
         "chat_id": chat_id, "user_id": user_id, "base_job_id": base_job_id, "lang": lang,
         "category": category, "video_path": str(video_path), "thumb_path": str(thumb_path),
-        "vk_only": vk_only,
-    })
+        "vk_only": vk_only, "attempts": 0,
+    }
+    _sync_deferred_results(entry)
+    deferred_publishes.append(entry)
     _save_deferred_publishes()
 
 
@@ -1005,28 +1175,80 @@ async def on_job_done(job: "Job", video_path, thumb_path, error):
     flag = "🇷🇺" if job.lang == "ru" else "🇺🇸"
     base_job_id = job.job_dir.parent.name
 
-    if error:
+    try:
+        if error:
+            await client.send_message(
+                job.chat_id,
+                f"❌ {flag} Ошибка:\n`{error}`\n\n"
+                f"/retry {job.lang} — повторить только этот язык, без пересборки другого"
+            )
+            return
+
+        # Rendering succeeded — only now is it safe to mark the source item as
+        # "done" so a render failure doesn't permanently skip it.
+        commit_dedup = job_dedup_pending.pop(base_job_id, None)
+        if commit_dedup:
+            commit_dedup()
+
+        category = job_category.get(base_job_id, "Other")
+
+        try:
+            await client.send_message(job.chat_id, f"{flag} Видео готово, публикую...")
+            await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
+        except Exception:
+            log.exception(f"Публикация {base_job_id}:{job.lang} упала")
+
+        if _fully_published(base_job_id, job.lang):
+            _remove_published_content(job.job_dir)
+        else:
+            # Held back by the daily cap, or an upload failed / isn't authorized:
+            # the background loop keeps retrying until the files expire.
+            _register_deferred(job.chat_id, job.user_id, base_job_id, job.lang, category,
+                               video_path, thumb_path, vk_only=False)
+    finally:
+        left = job_langs_left.get(base_job_id, 1) - 1
+        if left > 0:
+            job_langs_left[base_job_id] = left
+        else:
+            _untrack_job(base_job_id)
+
+
+async def _flush_one_deferred(entry: dict):
+    label = f"{entry['base_job_id']}:{entry['lang']}"
+
+    if not Path(entry["video_path"]).exists() or not Path(entry["thumb_path"]).exists():
+        # cleanup.py removes working files after RETENTION_DAYS, so there is
+        # nothing left to publish — without this the entry was retried forever.
+        deferred_publishes.remove(entry)
+        _save_deferred_publishes()
+        log.warning(f"Отложенная публикация {label}: файлы удалены по сроку хранения, снимаю с очереди")
         await client.send_message(
-            job.chat_id,
-            f"❌ {flag} Ошибка:\n`{error}`\n\n"
-            f"/retry {job.lang} — повторить только этот язык, без пересборки другого"
-        )
+            entry["chat_id"], f"🗑 Отложенное видео {label} снято с очереди: файлы удалены по сроку хранения.")
         return
 
-    # Rendering succeeded — only now is it safe to mark the source item as
-    # "done" so a render failure doesn't permanently skip it.
-    commit_dedup = job_dedup_pending.pop(base_job_id, None)
-    if commit_dedup:
-        commit_dedup()
+    if _publishes_today(entry["lang"]) >= DAILY_VIDEO_CAP:
+        return                                    # nothing can go out today; stay silent
+    if entry.get("next_try", 0) > time.time():
+        return
 
-    category = job_category.get(base_job_id, "Other")
+    _seed_last_result(entry)
+    held_by_cap = not await _publish(
+        entry["chat_id"], entry["user_id"], entry["base_job_id"], entry["lang"],
+        entry["category"], Path(entry["video_path"]), Path(entry["thumb_path"]),
+        vk_only=entry["vk_only"], quiet_unless_uploaded=True)
+    _sync_deferred_results(entry)
 
-    await client.send_message(job.chat_id, f"{flag} Видео готово, публикую...")
-    fully_published = await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
-    if not fully_published:
-        _register_deferred(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path, vk_only=False)
-    elif _fully_published(base_job_id, job.lang):
-        _remove_published_content(job.job_dir)
+    if _fully_published(entry["base_job_id"], entry["lang"]):
+        deferred_publishes.remove(entry)
+        _save_deferred_publishes()
+        _remove_published_content(Path(entry["video_path"]).parent)
+        return
+
+    if not held_by_cap:                           # an upload was attempted and failed: back off
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        entry["next_try"] = time.time() + min(
+            DEFERRED_RETRY_MAX_BACKOFF_SECONDS, DEFERRED_FLUSH_INTERVAL_SECONDS * 2 ** entry["attempts"])
+    _save_deferred_publishes()
 
 
 async def _flush_deferred_publishes():
@@ -1034,18 +1256,9 @@ async def _flush_deferred_publishes():
         await asyncio.sleep(DEFERRED_FLUSH_INTERVAL_SECONDS)
         for entry in list(deferred_publishes):
             try:
-                fully_published = await _publish(
-                    entry["chat_id"], entry["user_id"], entry["base_job_id"], entry["lang"],
-                    entry["category"], Path(entry["video_path"]), Path(entry["thumb_path"]),
-                    vk_only=entry["vk_only"])
-            except Exception as e:
-                log.error(f"Отложенная публикация {entry['base_job_id']}:{entry['lang']} не удалась: {e}")
-                continue
-            if fully_published:
-                deferred_publishes.remove(entry)
-                _save_deferred_publishes()
-                if _fully_published(entry["base_job_id"], entry["lang"]):
-                    _remove_published_content(Path(entry["video_path"]).parent)
+                await _flush_one_deferred(entry)
+            except Exception:
+                log.exception(f"Отложенная публикация {entry['base_job_id']}:{entry['lang']} не удалась")
 
 
 async def _ensure_joined(channel_username: str):
@@ -1065,18 +1278,39 @@ async def _ensure_joined(channel_username: str):
 
 
 # ── Старт ────────────────────────────────────────────────────────────────────
+_background_tasks: set = set()
+
+
+def _spawn(name: str, coro_fn):
+    """Runs a background loop under a supervisor. A bare create_task() whose
+    reference is dropped dies silently on the first unexpected exception
+    (e.g. a full disk while saving state) and is never restarted."""
+    async def runner():
+        while True:
+            try:
+                await coro_fn()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(f"Фоновая задача {name} упала, перезапуск через 60 с")
+                await asyncio.sleep(60)
+    task = asyncio.create_task(runner(), name=name)
+    _background_tasks.add(task)
+
+
 async def main():
     log.info("Запуск NotebookLM userbot...")
     await client.start(phone=PHONE_NUMBER)
     log.info("Клиент подключён. Ожидаем сообщения...")
     await _ensure_joined(ARXIV_CHANNEL_EN)
     await _ensure_joined(ARXIV_CHANNEL_RU)
-    asyncio.create_task(job_queue.run(on_done_callback=on_job_done))
-    asyncio.create_task(_check_coindesk_newsletters())
-    asyncio.create_task(_check_ru_auto_daily())
-    asyncio.create_task(_check_quarterly_digest())
-    asyncio.create_task(_check_jpmorgan_weekly())
-    asyncio.create_task(_flush_deferred_publishes())
+    _spawn("job_queue", lambda: job_queue.run(on_done_callback=on_job_done))
+    _spawn("coindesk", _check_coindesk_newsletters)
+    _spawn("ru_auto", _check_ru_auto_daily)
+    _spawn("quarterly_digest", _check_quarterly_digest)
+    _spawn("jpmorgan", _check_jpmorgan_weekly)
+    _spawn("deferred_flush", _flush_deferred_publishes)
     await client.run_until_disconnected()
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ Safe to run by hand any time: `python3 cleanup.py` (add --dry-run to preview).
 """
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -24,14 +25,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("cleanup")
 
 BASE_DIR = Path(__file__).parent
+
+try:  # same .env as bot.py, so WORKSPACE_DIR/RETENTION_DAYS agree between the two
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    pass
+
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
+# A video waiting in deferred_publishes.json (daily cap / failed upload) is kept
+# this long instead, so the backlog isn't deleted before it gets its slot.
+DEFERRED_RETENTION_DAYS = int(os.getenv("DEFERRED_RETENTION_DAYS", "21"))
 MAX_LOG_MB = int(os.getenv("MAX_LOG_MB", "20"))
 
-MEDIA_DIRS = ["workspace", "uploaded_videos", "videos_to_upload"]
+_workspace = Path(os.getenv("WORKSPACE_DIR", "./workspace"))
+WORKSPACE_DIR = _workspace if _workspace.is_absolute() else (BASE_DIR / _workspace).resolve()
+MEDIA_DIRS = [WORKSPACE_DIR, BASE_DIR / "uploaded_videos", BASE_DIR / "videos_to_upload"]
 
 
-def _clean_stale_files(directory: Path, retention_seconds: float, dry_run: bool) -> tuple[int, int]:
-    """Deletes files older than retention_seconds under directory (recursive)."""
+def _deferred_job_dirs() -> set[Path]:
+    """Job folders still referenced by the bot's deferred-publish queue."""
+    path = BASE_DIR / "deferred_publishes.json"
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return set()
+    dirs = set()
+    for e in entries:
+        video = Path(e.get("video_path", ""))
+        video = video if video.is_absolute() else BASE_DIR / video
+        dirs.add(video.resolve().parent.parent)   # workspace/<user>/<job>
+    return dirs
+
+
+def _clean_stale_files(directory: Path, retention_seconds: float, dry_run: bool,
+                       protected: set[Path] = frozenset(), protected_seconds: float = 0) -> tuple[int, int]:
+    """Deletes files older than retention_seconds under directory (recursive).
+    Files under a protected job folder get protected_seconds instead."""
     if not directory.exists():
         return 0, 0
     removed_files = 0
@@ -41,8 +71,11 @@ def _clean_stale_files(directory: Path, retention_seconds: float, dry_run: bool)
         if not f.is_file():
             continue
         try:
+            limit = retention_seconds
+            if protected and any(p in f.resolve().parents for p in protected):
+                limit = max(retention_seconds, protected_seconds)
             age = now - f.stat().st_mtime
-            if age <= retention_seconds:
+            if age <= limit:
                 continue
             size = f.stat().st_size
             if not dry_run:
@@ -79,9 +112,13 @@ def _prune_empty_dirs(directory: Path, min_age_seconds: float, dry_run: bool) ->
 
 def clean_media(dry_run: bool):
     retention_seconds = RETENTION_DAYS * 86400
-    for name in MEDIA_DIRS:
-        d = BASE_DIR / name
-        files, freed = _clean_stale_files(d, retention_seconds, dry_run)
+    protected = _deferred_job_dirs()
+    if protected:
+        log.info(f"{len(protected)} deferred job folder(s) kept up to {DEFERRED_RETENTION_DAYS}d")
+    for d in MEDIA_DIRS:
+        name = d.name
+        files, freed = _clean_stale_files(d, retention_seconds, dry_run,
+                                          protected, DEFERRED_RETENTION_DAYS * 86400)
         if files:
             verb = "would remove" if dry_run else "removed"
             log.info(f"{name}/: {verb} {files} files older than {RETENTION_DAYS}d "

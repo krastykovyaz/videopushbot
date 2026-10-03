@@ -69,6 +69,12 @@ def get_pdf_change_marker(url: str, timeout: int = 15) -> str | None:
     """
     try:
         resp = requests.head(url, timeout=timeout, allow_redirects=True, headers=_HEADERS)
+        # A 403/404 error page can carry its own ETag/Last-Modified; that must not
+        # look like "a new brief was published".
+        if resp.status_code != 200 or "pdf" not in resp.headers.get("Content-Type", "").lower():
+            log.warning(f"get_pdf_change_marker: {url} -> HTTP {resp.status_code} "
+                        f"({resp.headers.get('Content-Type', '?')}), skipping this check")
+            return None
         etag = resp.headers.get("ETag", "")
         last_modified = resp.headers.get("Last-Modified", "")
         if not etag and not last_modified:

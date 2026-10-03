@@ -3,8 +3,10 @@
 Каждый кадр = картинка из PDF + субтитры + иконка ведущего.
 """
 
+import hashlib
 import json
 import logging
+import os
 import textwrap
 from pathlib import Path
 
@@ -45,7 +47,13 @@ def build_frames(script: dict, timeline: list[dict], job_dir: Path, lang: str = 
     title = " ".join(script.get("title", "").split())
 
     for entry in timeline:
-        frame_path = frames_dir / f"frame_{entry['seg_id']:04d}.png"
+        # Cache key covers everything drawn on the frame: /retry regenerates the
+        # script in the same folder, and a position-only name reused old frames.
+        key = hashlib.sha1("|".join(str(x) for x in (
+            lang, title, entry["speaker"], entry["text"],
+            entry.get("image_path"), entry.get("image_caption", ""))).encode("utf-8")).hexdigest()[:10]
+        frame_path = frames_dir / f"frame_{entry['seg_id']:04d}_{key}.png"
+        entry["frame_path"] = str(frame_path)
         if frame_path.exists():
             continue  # кэш
 
@@ -58,7 +66,11 @@ def build_frames(script: dict, timeline: list[dict], job_dir: Path, lang: str = 
             fonts=fonts,
             lang=lang,
         )
-        img.save(str(frame_path), "PNG", optimize=True)
+        # Write-then-rename: a process killed mid-save must not leave a
+        # truncated PNG that later runs would happily reuse as "cached".
+        tmp_path = frame_path.with_name(frame_path.name + ".tmp")
+        img.save(str(tmp_path), "PNG", optimize=True)
+        os.replace(tmp_path, frame_path)
         log.info(f"Кадр {entry['seg_id']+1}/{len(timeline)} сохранён")
 
     log.info(f"Все кадры → {frames_dir}")
@@ -231,6 +243,16 @@ def _draw_rounded_rect(draw, x0, y0, x1, y1, radius, fill):
     draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fill_rgba)
 
 
+def _fallback_font(size):
+    # Pillow's built-in font has no Cyrillic: Russian text renders as boxes.
+    # Say so loudly instead of silently shipping unreadable frames.
+    log.error("Не найден TTF-шрифт с кириллицей (нужен fonts-dejavu-core) — текст на кадрах будет нечитаемым")
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def _load_fonts() -> dict:
     """Загрузить шрифты. Фоллбэк на встроенный если нет TTF."""
     font_paths = [
@@ -257,9 +279,9 @@ def _load_fonts() -> dict:
 
     def load(path, size):
         try:
-            return ImageFont.truetype(path, size) if path else ImageFont.load_default()
+            return ImageFont.truetype(path, size) if path else _fallback_font(size)
         except Exception:
-            return ImageFont.load_default()
+            return _fallback_font(size)
 
     return {
         "title":   load(font_path, 34),

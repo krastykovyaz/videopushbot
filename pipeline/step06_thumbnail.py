@@ -140,6 +140,16 @@ def _find_best_image(blocks: list[dict]):
     return None
 
 
+def _fallback_font(size):
+    # Pillow's built-in font has no Cyrillic: Russian text renders as boxes.
+    # Say so loudly instead of silently shipping unreadable frames.
+    log.error("Не найден TTF-шрифт с кириллицей (нужен fonts-dejavu-core) — текст на кадрах будет нечитаемым")
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def _load_fonts() -> dict:
     font_paths_bold = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -165,9 +175,9 @@ def _load_fonts() -> dict:
 
     def load(path, size):
         try:
-            return ImageFont.truetype(path, size) if path else ImageFont.load_default()
+            return ImageFont.truetype(path, size) if path else _fallback_font(size)
         except Exception:
-            return ImageFont.load_default()
+            return _fallback_font(size)
 
     return {
         "title": load(bold, 96),

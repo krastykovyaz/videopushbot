@@ -17,7 +17,7 @@
    3. Найдите cookie с именем 'auth' или 'access_token'
    4. Скопируйте значение
    ```
-   {%22accessToken%22:%2233e623ed10100dc690ca409bf428b76f3ac8a919c652e88b4596925034445ae6%22%2C%22refreshToken%22:%22b24b2ca3eb9ab4c746bac6068c234dbf57ed2469777d193ba7fce96e74b1e116%22%2C%22expiresAt%22:1773737236767%2C%22isNewUser%22:false}
+   {"accessToken":"<YOUR_ACCESS_TOKEN>","refreshToken":"<YOUR_REFRESH_TOKEN>","expiresAt":<UNIX_MS>,"isEmptyUser":false}
 
    **Метод 2: Через официальное API (если доступно)**
    ```

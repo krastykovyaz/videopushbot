@@ -10,9 +10,11 @@
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -32,6 +34,22 @@ EDGE_VOICES_EN = {
     "host1": os.getenv("EDGE_VOICE_HOST1_EN", "en-US-AndrewNeural"),
     "host2": os.getenv("EDGE_VOICE_HOST2_EN", "en-US-JennyNeural"),
 }
+
+# Запасные нейроголоса Edge, если основной голос не отвечает. ru-RU-DmitryNeural
+# периодически возвращает "No audio was received" (проверено: 6/12 сегментов
+# одного эпизода), а у ru-RU всего два голоса — поэтому для русского берём
+# мультиязычные голоса, которые читают по-русски (проверено на сервере).
+EDGE_FALLBACK_VOICES = {
+    "ru": {
+        "host1": os.getenv("EDGE_FALLBACK_HOST1_RU", "en-US-BrianMultilingualNeural"),
+        "host2": os.getenv("EDGE_FALLBACK_HOST2_RU", "en-US-EmmaMultilingualNeural"),
+    },
+    "en": {
+        "host1": os.getenv("EDGE_FALLBACK_HOST1_EN", "en-US-GuyNeural"),
+        "host2": os.getenv("EDGE_FALLBACK_HOST2_EN", "en-US-AriaNeural"),
+    },
+}
+EDGE_ATTEMPT_TIMEOUT_SECONDS = 60
 
 # Chatterbox: опциональные референсные WAV (EN фоллбэк)
 CHATTERBOX_REF = {
@@ -64,7 +82,10 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
         if not text:
             continue
 
-        wav_path = audio_dir / f"seg_{i:04d}_{speaker}.wav"
+        # Cache key includes the text: /retry regenerates the script into the
+        # same folder, and a position-only name reused the OLD audio for new text.
+        text_hash = hashlib.sha1(f"{lang}|{speaker}|{text}".encode("utf-8")).hexdigest()[:10]
+        wav_path = audio_dir / f"seg_{i:04d}_{speaker}_{text_hash}.wav"
 
         if not wav_path.exists():
             log.info(f"TTS [{lang}/{speaker}] сег {i+1}/{len(segments)}: {text[:60]}...")
@@ -79,7 +100,8 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
             # Битый/невалидный кэш (например, старый AIFF-как-.wav) — перегенерировать.
             log.warning(f"Кэш сегмента {i+1} повреждён ({e}), перегенерирую...")
             wav_path.unlink(missing_ok=True)
-            _synthesize_sync(text, speaker, wav_path, lang)
+            if not _synthesize_sync(text, speaker, wav_path, lang):
+                fallback_count += 1
             seg_audio = AudioSegment.from_wav(str(wav_path))
         duration_ms = len(seg_audio)
 
@@ -121,76 +143,87 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
     return timeline, fallback_count
 
 
+def _edge_voice_chain(lang: str, speaker: str) -> list[str]:
+    voices = EDGE_VOICES_RU if lang == "ru" else EDGE_VOICES_EN
+    primary = voices.get(speaker, list(voices.values())[0])
+    fallback = EDGE_FALLBACK_VOICES.get(lang, {}).get(speaker)
+    chain = [primary, primary]                 # the primary failure is often transient
+    if fallback and fallback != primary:
+        chain.append(fallback)
+    return chain
+
+
 def _synthesize_sync(text: str, speaker: str, out_path: Path, lang: str) -> bool:
     """
-    Синхронная обёртка для async Edge TTS.
-    asyncio.run() не работает внутри уже запущенного loop (Telethon).
-    Используем отдельный поток с новым event loop.
+    Озвучка одного сегмента: Edge TTS (основной голос, повтор, запасной
+    нейроголос), и только потом espeak-ng/pyttsx3.
+
+    Каждая попытка Edge пишет в свой уникальный временный файл и запускается
+    в отдельном потоке с собственным event loop (asyncio.run() не работает
+    внутри loop Telethon). Поток, брошенный по таймауту, может завершиться
+    позже — он пишет только в свой временный файл и не затрёт итоговый WAV.
 
     Возвращает True если сработал Edge TTS, False если пришлось откатиться
-    на espeak-ng/pyttsx3 (нужно вызывающему коду, чтобы посчитать деградацию
-    качества озвучки за весь эпизод).
+    на espeak-ng/pyttsx3.
     """
     import concurrent.futures
+    import time as _time
 
-    def run_in_new_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    last_err = None
+    for attempt, voice in enumerate(_edge_voice_chain(lang, speaker)):
+        if attempt:
+            _time.sleep(2)
+        tmp_wav = out_path.with_name(f"{out_path.stem}.{uuid.uuid4().hex[:8]}.tmp.wav")
+
+        def run_in_new_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(_synthesize_edge(text, voice, tmp_wav))
+            finally:
+                loop.close()
+
+        # Managed manually (not `with`): `with`'s implicit shutdown(wait=True)
+        # would block on the very call the timeout is meant to give up on.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            return loop.run_until_complete(
-                _synthesize_edge(text, speaker, out_path, lang)
-            )
+            ex.submit(run_in_new_loop).result(timeout=EDGE_ATTEMPT_TIMEOUT_SECONDS)
+            if not tmp_wav.exists() or tmp_wav.stat().st_size < 1000:
+                raise RuntimeError("Edge TTS создал пустой файл")
+            os.replace(tmp_wav, out_path)
+            log.info(f"Edge TTS OK [{lang}/{speaker}, {voice}]: {out_path.name}")
+            return True
+        except Exception as e:
+            last_err = e
+            log.warning(f"Edge TTS ошибка [{lang}/{speaker}, {voice}]: {e}")
         finally:
-            loop.close()
+            ex.shutdown(wait=False)
+            tmp_wav.unlink(missing_ok=True)
 
-    # Managed manually (not `with`) so a timeout can abandon the background
-    # thread via shutdown(wait=False) — `with`'s implicit shutdown(wait=True)
-    # blocks on the SAME hung call the timeout was meant to give up on,
-    # making the 120s timeout a no-op and freezing the single worker on it.
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        future = ex.submit(run_in_new_loop)
-        future.result(timeout=120)
-        ex.shutdown(wait=False)
-        # Проверить что файл реально создался и не пустой
-        if not out_path.exists() or out_path.stat().st_size < 1000:
-            raise RuntimeError(f"Edge TTS создал пустой файл: {out_path}")
-        log.info(f"Edge TTS OK [{lang}/{speaker}]: {out_path.name}")
-        return True
-    except Exception as e:
-        ex.shutdown(wait=False)
-        log.warning(f"Edge TTS ошибка [{lang}/{speaker}]: {e}, фоллбэк...")
-        if _synthesize_espeak_ng_cli(text, speaker, out_path, lang):
-            log.info(f"espeak-ng CLI OK [{lang}/{speaker}]: {out_path.name}")
-        else:
-            _synthesize_pyttsx3(text, speaker, out_path, lang)
-        return False
+    log.warning(f"Edge TTS недоступен для [{lang}/{speaker}] ({last_err}), фоллбэк на espeak-ng...")
+    if _synthesize_espeak_ng_cli(text, speaker, out_path, lang):
+        log.info(f"espeak-ng CLI OK [{lang}/{speaker}]: {out_path.name}")
+    else:
+        _synthesize_pyttsx3(text, speaker, out_path, lang)
+    return False
 
 
 # ── Edge TTS (RU + EN) ────────────────────────────────────────────────────────
 
-async def _synthesize_edge(text: str, speaker: str, out_path: Path, lang: str):
+async def _synthesize_edge(text: str, voice: str, out_wav: Path):
     """
-    Microsoft Edge TTS — бесплатно, онлайн, качество почти как платный ElevenLabs.
-    Голоса: ru-RU-DmitryNeural, ru-RU-SvetlanaNeural, en-US-AndrewNeural, etc.
-    pip install edge-tts
+    Microsoft Edge TTS — бесплатно, онлайн. Пишет только в out_wav (уникальный
+    временный путь, выбранный вызывающим кодом).
     """
     import edge_tts
 
-    voices = EDGE_VOICES_RU if lang == "ru" else EDGE_VOICES_EN
-    voice  = voices.get(speaker, list(voices.values())[0])
-
-    # Сохранить как MP3, потом конвертим в WAV через pydub
-    mp3_tmp = out_path.with_suffix(".tmp.mp3")
-
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate="+0%", volume="+0%")
-    await communicate.save(str(mp3_tmp))
-
-    # MP3 → WAV (pydub)
-    audio = AudioSegment.from_mp3(str(mp3_tmp))
-    audio.export(str(out_path), format="wav")
-    mp3_tmp.unlink(missing_ok=True)
-    log.info(f"Edge TTS OK [{voice}]: {out_path.name}")
+    mp3_tmp = out_wav.with_suffix(".mp3")
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate="+0%", volume="+0%")
+        await communicate.save(str(mp3_tmp))
+        AudioSegment.from_mp3(str(mp3_tmp)).export(str(out_wav), format="wav")
+    finally:
+        mp3_tmp.unlink(missing_ok=True)
 
 
 # ── Chatterbox (EN фоллбэк) ───────────────────────────────────────────────────

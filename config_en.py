@@ -3,9 +3,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} is not set — add it to .env (see notebooklm/.env.example)")
+    return value
+
 CONFIG = {
         # Telegram API credentials
-    'api_id': int(os.getenv('API_ID')),
+    'api_id': int(_required('API_ID')),
     'api_hash': os.getenv('API_HASH'),
     'phone_number': os.getenv('PHONE_NUMBER'),
     
@@ -14,7 +21,7 @@ CONFIG = {
     'processed_folder': os.getenv('PROCESSED_FOLDER'),
     
     # Разрешённые пользователи
-    'allowed_users': list(map(int, os.getenv('ALLOWED_USERS').split(','))),
+    'allowed_users': [int(x) for x in os.getenv('ALLOWED_USERS', '').split(',') if x.strip()],
     
     # Поддерживаемые типы файлов
     'video_extensions': ['.mp4', '.mov', '.avi', '.mkv', '.webm'],

@@ -10,15 +10,19 @@ discussion rather than reading the source verbatim (same pattern already
 used for PDF sources) — never reproduced as-is.
 """
 
+import io
+import ipaddress
 import json
 import logging
 import re
+import socket
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
+from PIL import Image
 
 log = logging.getLogger("webpage_extract")
 
@@ -28,6 +32,38 @@ _HEADERS = {
 }
 _MAX_IMAGES = 6
 _MIN_IMAGE_BYTES = 5000  # skip tiny icons/placeholders
+_MAX_REDIRECTS = 3
+# Formats the frame/thumbnail renderer (PIL) can actually draw. SVG logos were
+# being saved as ".png" and then failing to load, wasting image slots.
+_IMAGE_EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
+
+
+def _is_public_http_url(url: str) -> bool:
+    """Image URLs come from scraped pages (untrusted). Only fetch plain
+    http(s) URLs whose host resolves exclusively to public addresses — never
+    loopback, private, link-local or metadata endpoints."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        return bool(infos) and all(ipaddress.ip_address(info[4][0]).is_global for info in infos)
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_get(url: str, **kwargs) -> requests.Response:
+    """GET that re-validates every redirect hop with _is_public_http_url."""
+    for _ in range(_MAX_REDIRECTS + 1):
+        if not _is_public_http_url(url):
+            raise ValueError(f"refusing non-public URL: {url}")
+        resp = requests.get(url, headers=_HEADERS, allow_redirects=False, **kwargs)
+        if resp.is_redirect and resp.headers.get("Location"):
+            url = urljoin(url, resp.headers["Location"])
+            resp.close()
+            continue
+        return resp
+    raise ValueError(f"too many redirects: {url}")
 
 
 def extract_webpage(url: str, job_dir: Path) -> list[dict]:
@@ -117,11 +153,11 @@ _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # a scraped page's image URL is untrusted i
 
 def _download_image(url: str, img_dir: Path, idx: int) -> str | None:
     try:
-        with requests.get(url, headers=_HEADERS, timeout=20, stream=True) as r:
+        with _safe_get(url, timeout=20, stream=True) as r:
             r.raise_for_status()
-            if "image" not in r.headers.get("Content-Type", ""):
+            content_type = r.headers.get("Content-Type", "").lower()
+            if "image" not in content_type or "svg" in content_type:
                 return None
-            content_type = r.headers.get("Content-Type", "")
             chunks = []
             total = 0
             for chunk in r.iter_content(chunk_size=65536):
@@ -132,9 +168,20 @@ def _download_image(url: str, img_dir: Path, idx: int) -> str | None:
                 chunks.append(chunk)
         if total < _MIN_IMAGE_BYTES:
             return None
-        ext = ".jpg" if "jpeg" in content_type else ".png"
+        data = b"".join(chunks)
+        # Trust the bytes, not the Content-Type header: keep only images PIL
+        # can open, and name the file after the real format.
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                fmt = im.format
+                im.verify()
+        except Exception:
+            return None
+        ext = _IMAGE_EXT.get(fmt)
+        if not ext:
+            return None
         img_path = img_dir / f"web_{idx:02d}{ext}"
-        img_path.write_bytes(b"".join(chunks))
+        img_path.write_bytes(data)
         return str(img_path)
     except Exception as e:
         log.warning(f"webpage_extract: failed to download image {url}: {e}")
@@ -144,17 +191,18 @@ def _download_image(url: str, img_dir: Path, idx: int) -> str | None:
 def _resolve_image_url(src: str, page_url: str) -> str | None:
     """Handles plain URLs, protocol-relative URLs, and Next.js's image proxy
     (/_next/image?url=<encoded-original>&...), which is what CoinDesk uses."""
-    if src.startswith("//"):
-        return "https:" + src
-    if src.startswith("/"):
-        absolute = urljoin(page_url, src)
-        parsed = urlparse(absolute)
-        if "/_next/image" in parsed.path:
-            qs = parse_qs(parsed.query)
-            if "url" in qs:
-                return qs["url"][0]
-        return absolute
-    return src
+    src = src.strip()
+    if src.startswith("data:"):
+        return None
+    # urljoin handles absolute, protocol-relative ("//host/x"), root-relative
+    # ("/x") and plain relative ("images/x.jpg") sources alike.
+    absolute = urljoin(page_url, src)
+    parsed = urlparse(absolute)
+    if "/_next/image" in parsed.path:
+        qs = parse_qs(parsed.query)
+        if "url" in qs:
+            absolute = urljoin(page_url, qs["url"][0])
+    return absolute
 
 
 # Matches CoinDesk-style dated article paths, e.g. /policy/2026/09/13/some-slug
@@ -172,12 +220,21 @@ def find_article_links(listing_url: str, limit: int = 5, path_regex: "re.Pattern
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    base = f"{urlparse(listing_url).scheme}://{urlparse(listing_url).netloc}"
+    listing = urlparse(listing_url)
+    base = f"{listing.scheme}://{listing.netloc}"
+    site = listing.hostname.removeprefix("www.")
     seen = set()
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        path = urlparse(href).path if href.startswith("http") else href
+        if href.startswith("http"):
+            # An absolute link to another host must not be fetched just because
+            # its path happens to match the article pattern.
+            if (urlparse(href).hostname or "").removeprefix("www.") != site:
+                continue
+            path = urlparse(href).path
+        else:
+            path = urlparse(href).path
         if pattern.match(path):
             full_url = href if href.startswith("http") else base + path
             if full_url not in seen:
