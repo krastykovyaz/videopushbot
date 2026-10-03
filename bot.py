@@ -958,6 +958,33 @@ def _register_deferred(chat_id, user_id, base_job_id, lang, category, video_path
     _save_deferred_publishes()
 
 
+def _remove_published_content(lang_dir: Path):
+    """Free disk as soon as a video is fully published: drop that language's working files
+    (frames, audio, the final mp4), then the whole job folder once no language is left in it.
+    Anything not fully published is never touched here; cleanup.py still sweeps leftovers by age."""
+    try:
+        lang_dir = Path(lang_dir).resolve()
+        job_dir = lang_dir.parent
+        root = WORKSPACE.resolve()
+        if root not in lang_dir.parents or job_dir == root or job_dir.parent == root:
+            return                      # must be workspace/<user>/<job>/<lang>, nothing else
+        base_job_id = job_dir.name
+        if any(e["base_job_id"] == base_job_id and e["lang"] == lang_dir.name for e in deferred_publishes):
+            return                      # still waiting to be published
+        freed = 0
+        if lang_dir.is_dir():
+            freed += sum(f.stat().st_size for f in lang_dir.rglob("*") if f.is_file())
+            shutil.rmtree(lang_dir, ignore_errors=True)
+        still_needed = any(e["base_job_id"] == base_job_id for e in deferred_publishes)
+        other_langs = [d for d in job_dir.iterdir() if d.is_dir() and d.name != "sample"] if job_dir.is_dir() else []
+        if job_dir.is_dir() and not other_langs and not still_needed:
+            freed += sum(f.stat().st_size for f in job_dir.rglob("*") if f.is_file())
+            shutil.rmtree(job_dir, ignore_errors=True)
+        log.info(f"Опубликовано, рабочие файлы удалены: {base_job_id}/{lang_dir.name} ({freed / 1e6:.0f} MB)")
+    except Exception as e:
+        log.warning(f"Не удалось удалить рабочие файлы {lang_dir}: {e}")
+
+
 async def on_job_done(job: "Job", video_path, thumb_path, error):
     flag = "🇷🇺" if job.lang == "ru" else "🇺🇸"
     base_job_id = job.job_dir.parent.name
@@ -982,6 +1009,8 @@ async def on_job_done(job: "Job", video_path, thumb_path, error):
     fully_published = await _publish(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path)
     if not fully_published:
         _register_deferred(job.chat_id, job.user_id, base_job_id, job.lang, category, video_path, thumb_path, vk_only=False)
+    else:
+        _remove_published_content(job.job_dir)
 
 
 async def _flush_deferred_publishes():
@@ -999,6 +1028,7 @@ async def _flush_deferred_publishes():
             if fully_published:
                 deferred_publishes.remove(entry)
                 _save_deferred_publishes()
+                _remove_published_content(Path(entry["video_path"]).parent)
 
 
 async def _ensure_joined(channel_username: str):
