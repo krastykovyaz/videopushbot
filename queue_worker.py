@@ -130,7 +130,7 @@ async def run_pipeline(job: Job) -> tuple[Path, Path]:
     await p(cid, f"✅ Шаг 2/6 — скрипт готов: {word_count} слов (~{est_min} мин){warn}")
 
     # Шаг 3 — TTS
-    await p(cid, "⏳ Шаг 3/6 — озвучиваю (Edge TTS)... это займёт пару минут")
+    await p(cid, "⏳ Шаг 3/6 — озвучиваю (Gemini TTS, запасной — Edge)... это займёт пару минут")
     timeline, tts_fallback_count = await asyncio.to_thread(generate_tts, script, d, lang=job.lang)
     fallback_warn = f" ⚠️ {tts_fallback_count} сегм. роботизированным голосом" if tts_fallback_count else ""
     await p(cid, f"✅ Шаг 3/6 — аудио готово: {len(timeline)} сегментов{fallback_warn}")

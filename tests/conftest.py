@@ -22,6 +22,7 @@ os.environ.update({
     "SECRET_YOUTUBE_FILE_En": str(SANDBOX / "missing_en.json"),
     "GEMINI_API_KEY": "test", "GOOGLE_API_KEY": "test", "API_KEY": "test",
     "WORKSPACE_DIR": str(SANDBOX / "workspace"),
+    "GEMINI_TTS_LANGS": "",          # no real Gemini TTS calls from tests
 })
 sys.path.insert(0, str(REPO))
 os.chdir(SANDBOX)

@@ -19,6 +19,8 @@ from pathlib import Path
 
 from pydub import AudioSegment
 
+from pipeline import gemini_tts
+
 log = logging.getLogger("step03")
 
 PAUSE_BETWEEN_MS = 300
@@ -76,16 +78,16 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
     current_ms = 0
     fallback_count = 0
 
+    if gemini_tts.enabled_for(lang):
+        _prefill_with_gemini(segments, audio_dir, lang)
+
     for i, seg in enumerate(segments):
         speaker = seg.get("speaker", "host1")
         text    = seg.get("text", "").strip()
         if not text:
             continue
 
-        # Cache key includes the text: /retry regenerates the script into the
-        # same folder, and a position-only name reused the OLD audio for new text.
-        text_hash = hashlib.sha1(f"{lang}|{speaker}|{text}".encode("utf-8")).hexdigest()[:10]
-        wav_path = audio_dir / f"seg_{i:04d}_{speaker}_{text_hash}.wav"
+        wav_path = _segment_wav_path(audio_dir, i, speaker, text, lang)
 
         if not wav_path.exists():
             log.info(f"TTS [{lang}/{speaker}] сег {i+1}/{len(segments)}: {text[:60]}...")
@@ -141,6 +143,45 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
                      f"(espeak-ng/pyttsx3) вместо Edge TTS — голос местами может звучать роботизированно")
 
     return timeline, fallback_count
+
+
+def _segment_wav_path(audio_dir: Path, i: int, speaker: str, text: str, lang: str) -> Path:
+    # Cache key includes the text: /retry regenerates the script into the
+    # same folder, and a position-only name reused the OLD audio for new text.
+    text_hash = hashlib.sha1(f"{lang}|{speaker}|{text}".encode("utf-8")).hexdigest()[:10]
+    return audio_dir / f"seg_{i:04d}_{speaker}_{text_hash}.wav"
+
+
+def _prefill_with_gemini(segments: list[dict], audio_dir: Path, lang: str):
+    """Voices runs of uncached lines with Gemini dialogue TTS and writes each
+    line to its usual cache file. Lines it can't do are simply left missing,
+    so the regular per-line Edge path in generate_tts() covers them."""
+    pending = []                                     # (segment index, speaker, text)
+    for i, seg in enumerate(segments):
+        text = seg.get("text", "").strip()
+        speaker = seg.get("speaker", "host1")
+        if text and speaker in gemini_tts.SPEAKER_NAMES and not _segment_wav_path(audio_dir, i, speaker, text, lang).exists():
+            pending.append((i, speaker, text))
+    if not pending:
+        return
+
+    done = 0
+    for chunk in gemini_tts.make_chunks([(sp, t) for _, sp, t in pending]):
+        items = [pending[k] for k in chunk]
+        try:
+            pieces = gemini_tts.synthesize_chunk([(sp, t) for _, sp, t in items], lang)
+        except Exception as e:
+            log.warning(f"Gemini TTS: chunk failed ({e}), using Edge for it")
+            pieces = None
+        if not pieces:
+            continue
+        for (i, speaker, text), piece in zip(items, pieces):
+            path = _segment_wav_path(audio_dir, i, speaker, text, lang)
+            tmp = path.with_name(path.name + ".tmp")
+            piece.export(str(tmp), format="wav")
+            os.replace(tmp, path)
+            done += 1
+    log.info(f"Gemini TTS: {done}/{len(pending)} сегментов, остальные — Edge TTS")
 
 
 def _edge_voice_chain(lang: str, speaker: str) -> list[str]:
