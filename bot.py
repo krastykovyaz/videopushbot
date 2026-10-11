@@ -224,6 +224,8 @@ def _record_publish(lang: str):
 # instead of relying on the owner remembering to run /retry.
 DEFERRED_PUBLISH_FILE = Path("deferred_publishes.json")
 DEFERRED_FLUSH_INTERVAL_SECONDS = 30 * 60
+DEFERRED_FIRST_FLUSH_SECONDS = 60       # after a (re)start, look at the backlog soon, not in 30 minutes
+flush_wakeup = asyncio.Event()          # set to run the retry loop right now
 
 
 def _load_deferred_publishes() -> list:
@@ -485,7 +487,10 @@ async def handle_message(event):
         yt = yt_ru if lang == "ru" else yt_en
         try:
             yt.complete_manual_authorization(event.text.strip())
-            await event.reply(f"✅ YouTube {lang.upper()} авторизован! Токен сохранён.")
+            waiting = _retry_deferred_now(lang)
+            await event.reply(
+                f"✅ YouTube {lang.upper()} авторизован! Токен сохранён."
+                + (f"\n▶️ Отложенных видео {lang.upper()}: {waiting} — публикую прямо сейчас." if waiting else ""))
         except Exception as e:
             await event.reply(f"❌ Не удалось завершить авторизацию: {e}\n\nПопробуй /youtube_auth {lang} заново.")
         return
@@ -1251,9 +1256,31 @@ async def _flush_one_deferred(entry: dict):
     _save_deferred_publishes()
 
 
+def _retry_deferred_now(lang: str) -> int:
+    """Called once a YouTube re-authorization succeeds. The backoff on queued
+    videos (up to 6 h) was earned by failures that came from the dead token; it
+    must not delay them now that the cause is fixed. Returns how many were reset."""
+    reset = 0
+    for entry in deferred_publishes:
+        if entry["lang"] == lang:
+            entry.pop("next_try", None)
+            entry["attempts"] = 0
+            reset += 1
+    if reset:
+        _save_deferred_publishes()
+        flush_wakeup.set()
+    return reset
+
+
 async def _flush_deferred_publishes():
+    delay = DEFERRED_FIRST_FLUSH_SECONDS
     while True:
-        await asyncio.sleep(DEFERRED_FLUSH_INTERVAL_SECONDS)
+        try:
+            await asyncio.wait_for(flush_wakeup.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        flush_wakeup.clear()
+        delay = DEFERRED_FLUSH_INTERVAL_SECONDS
         for entry in list(deferred_publishes):
             try:
                 await _flush_one_deferred(entry)

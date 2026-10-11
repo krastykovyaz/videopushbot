@@ -150,3 +150,38 @@ def test_arxiv_link_requires_real_arxiv_host(bot_mod):
     assert bot_mod._arxiv_link_kind("https://arxiv.org/abs/2609.11109") == "abs"
     assert bot_mod._arxiv_link_kind("http://evil.example/?arxiv.org/pdf/2609.11109") is None
     assert bot_mod._arxiv_link_kind("https://arxiv.org.evil.example/pdf/2609.11109") is None
+
+
+def test_reauth_clears_the_backoff_for_that_language_only(bot_mod):
+    ru = {"base_job_id": "a", "lang": "ru", "attempts": 7, "next_try": 9e12}
+    en = {"base_job_id": "b", "lang": "en", "attempts": 13, "next_try": 9e12}
+    bot_mod.deferred_publishes.extend([ru, en])
+    assert bot_mod._retry_deferred_now("en") == 1
+    assert "next_try" not in en and en["attempts"] == 0
+    assert ru["attempts"] == 7 and ru["next_try"] == 9e12
+    assert bot_mod.flush_wakeup.is_set()
+    bot_mod.flush_wakeup.clear()
+    assert bot_mod._retry_deferred_now("en") == 1 and bot_mod.flush_wakeup.is_set()
+    bot_mod.flush_wakeup.clear()
+    bot_mod.deferred_publishes.clear()
+    assert bot_mod._retry_deferred_now("en") == 0 and not bot_mod.flush_wakeup.is_set()
+
+
+def test_flush_loop_runs_immediately_when_woken(bot_mod, monkeypatch):
+    monkeypatch.setattr(bot_mod, "DEFERRED_FIRST_FLUSH_SECONDS", 100)
+    monkeypatch.setattr(bot_mod, "DEFERRED_FLUSH_INTERVAL_SECONDS", 100)
+    entry = {"base_job_id": "x", "lang": "en"}
+    bot_mod.deferred_publishes.append(entry)
+    seen = []
+    async def fake_flush(e): seen.append(e["base_job_id"])
+    monkeypatch.setattr(bot_mod, "_flush_one_deferred", fake_flush)
+
+    async def scenario():
+        loop_task = asyncio.create_task(bot_mod._flush_deferred_publishes())
+        await asyncio.sleep(0.05)
+        assert seen == []                       # nothing before the delay or a wake-up
+        bot_mod.flush_wakeup.set()
+        await asyncio.sleep(0.1)
+        loop_task.cancel()
+    asyncio.run(scenario())
+    assert seen == ["x"]
