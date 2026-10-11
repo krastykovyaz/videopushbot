@@ -11,13 +11,12 @@ import re
 import time
 from pathlib import Path
 
-import google.generativeai as genai
 from dotenv import load_dotenv
+
+from common import gemini_models
 
 load_dotenv()
 log = logging.getLogger("step02")
-
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Groq — фоллбэк если Gemini упал/исчерпан
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -231,53 +230,17 @@ async def generate_script(blocks: list[dict], job_dir: Path, lang: str = "ru") -
     return script
 
 
-# Каждая модель Gemini имеет свою отдельную квоту (free tier ~20 req/min на модель),
-# поэтому при исчерпании лимита у одной модели выгоднее сразу пробовать следующую,
-# а не ждать сброса лимита той же модели. Порядок: новее/качественнее → проще.
-GEMINI_MODEL_CANDIDATES = [
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.7-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    # gemini-2.5-pro was dropped: it's now 404 for new users, and its
-    # suggested replacement (gemini-3.1-pro-preview) has zero free-tier
-    # quota on this API key (permanent 429, not transient) — only -flash
-    # tier models actually have free-tier access here.
-]
-
-
-def _is_rate_limited(err: str, type_name: str) -> bool:
-    # google.api_core.exceptions.ResourceExhausted (квота) не содержит "429" в тексте,
-    # поэтому проверяем и по типу исключения, и по ключевым словам в сообщении.
-    return (
-        "429" in err or "resourceexhausted" in type_name.lower()
-        or "quota" in err.lower() or "rate limit" in err.lower()
-    )
-
-
 async def _call_gemini_then_groq(prompt_full: str, prompt_short: str, lang: str) -> str:
     """Перебирает модели Gemini по очереди (у каждой свой лимит квоты).
     Если ни одна не сработала — Groq с коротким промптом."""
-    last_err = None
-
-    for model_name in GEMINI_MODEL_CANDIDATES:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(
-                model.generate_content, prompt_full, request_options={"timeout": 60})
-            log.info(f"Gemini {model_name}: успешно")
-            return response.text
-        except Exception as e:
-            last_err = e
-            err = str(e)
-            if _is_rate_limited(err, type(e).__name__):
-                log.warning(f"Gemini {model_name}: квота исчерпана, пробую следующую модель...")
-            else:
-                log.warning(f"Gemini {model_name}: {err[:120]}, пробую следующую модель...")
-
+    try:
+        result = await asyncio.to_thread(
+            gemini_models.generate_text, prompt_full,
+            api_key=os.getenv("GEMINI_API_KEY") or gemini_models.api_key(), timeout=60)
+        log.info(f"Gemini {result.answered}: успешно")
+        return result.text
+    except Exception as e:
+        last_err = e
     log.warning(f"Все модели Gemini недоступны (последняя ошибка: {str(last_err)[:120]}), переключаюсь на Groq...")
 
     if not GROQ_API_KEY:

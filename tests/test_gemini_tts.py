@@ -65,7 +65,7 @@ def test_quota_on_one_model_moves_to_the_next(monkeypatch):
     monkeypatch.setattr(gemini_tts.requests, "post", fake_post)
     monkeypatch.setattr(gemini_tts, "MIN_REQUEST_GAP_SECONDS", 0)
     monkeypatch.setattr(gemini_tts, "_exhausted_until", {})
-    monkeypatch.setattr(gemini_tts, "GEMINI_TTS_MODELS", ["model-a", "model-b"])
+    monkeypatch.setenv("GEMINI_TTS_MODELS", "model-a,model-b")
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     pieces = gemini_tts.synthesize_chunk([("host1", "a" * 100), ("host2", "b" * 50)], "ru")
     assert calls == ["model-a", "model-b"] and pieces and len(pieces) == 2

@@ -4,8 +4,7 @@ telethon==1.36.0
 # PDF
 pymupdf==1.24.5
 
-# LLM
-google-generativeai==0.7.2
+# LLM: Gemini is called over plain REST (common/gemini_models.py) — no SDK needed.
 
 # YouTube upload (imported unconditionally by common/youtube_uploader.py)
 google-auth-oauthlib>=1.2.0

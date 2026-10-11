@@ -7,7 +7,7 @@ and adds topic classification for automatic channel routing.
 import logging
 import re
 
-import google.generativeai as genai
+from common import gemini_models
 
 _DESCRIPTION_PROMPTS = {
     "ru": """
@@ -71,30 +71,6 @@ Pick exactly ONE category from this list that best fits the document:
 Return ONLY the category name, exactly as written above, with no extra text.
 """
 
-# Each Gemini model has its own separate free-tier quota (~20 req/min), so when one
-# is exhausted it's faster to try the next model than to wait out its rate limit.
-_FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.7-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    # gemini-2.5-pro was dropped: it's now 404 for new users, and its
-    # suggested replacement (gemini-3.1-pro-preview) has zero free-tier
-    # quota on this API key (permanent 429, not transient) — only -flash
-    # tier models actually have free-tier access here.
-]
-
-
-def _is_rate_limited(err: str, type_name: str) -> bool:
-    # google.api_core.exceptions.ResourceExhausted (quota) doesn't contain "429" in
-    # its text, so check the exception type name too.
-    return ("429" in err or "resourceexhausted" in type_name.lower()
-            or "quota" in err.lower() or "rate limit" in err.lower())
-
-
 def append_footer(description: str, lang: str) -> str:
     """Shared by Gemini-generated descriptions and channel-sourced ones (see
     bot.py's arxiv channel listeners), so the support/subscribe footer is
@@ -107,30 +83,19 @@ def append_footer(description: str, lang: str) -> str:
 
 
 class GeminiContentGenerator:
-    # Without a timeout a stalled request can hang indefinitely; since these
-    # calls run inside the pipeline's single worker, that freezes the whole
-    # job queue until the process is restarted.
+    # Without a timeout a stalled request can hang indefinitely; these calls
+    # run inside the pipeline's single worker, so that would freeze the queue.
     REQUEST_TIMEOUT_SECONDS = 60
 
     def __init__(self, api_key, model_name):
-        genai.configure(api_key=api_key)
-        # Try the configured model first, then rotate through the rest on quota errors.
-        self.model_candidates = [model_name] + [m for m in _FALLBACK_MODELS if m != model_name]
+        self.api_key = api_key
+        self.preferred_model = model_name      # MODEL_RU / MODEL_EN; the chain lives in gemini_models
         logging.info("✅ Gemini API initialized")
 
     def _generate(self, prompt: str) -> str:
-        last_err = None
-        for model_name in self.model_candidates:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    prompt, request_options={"timeout": self.REQUEST_TIMEOUT_SECONDS})
-                return response.text.strip()
-            except Exception as e:
-                last_err = e
-                reason = "quota exceeded" if _is_rate_limited(str(e), type(e).__name__) else str(e)[:100]
-                logging.warning(f"Gemini {model_name}: {reason}, trying next model...")
-        raise last_err
+        return gemini_models.generate_text(
+            prompt, api_key=self.api_key, preferred=self.preferred_model,
+            timeout=self.REQUEST_TIMEOUT_SECONDS).text
 
     def generate_description(self, title, content, lang="ru"):
         if len(content) > 5000:

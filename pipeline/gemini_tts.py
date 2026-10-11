@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 import requests
 from pydub import AudioSegment
+
+from common import gemini_models
 from pydub.silence import detect_leading_silence, detect_silence
 
 log = logging.getLogger("gemini_tts")
@@ -29,10 +31,8 @@ log = logging.getLogger("gemini_tts")
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 GEMINI_TTS_LANGS = {l.strip() for l in os.getenv("GEMINI_TTS_LANGS", "ru").split(",") if l.strip()}
-# Each model has its own free daily quota, so on a 429 the next one is tried.
-GEMINI_TTS_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_TTS_MODELS",
-    "gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts").split(",") if m.strip()]
+# Model names live in common/gemini_models.py. Each has its own free daily
+# quota, so on a 429 the next one is tried; a 404 skips the model for an hour.
 VOICES = {
     "host1": os.getenv("GEMINI_TTS_VOICE_HOST1", "Charon"),   # male
     "host2": os.getenv("GEMINI_TTS_VOICE_HOST2", "Kore"),     # female
@@ -55,12 +55,8 @@ _exhausted_until: dict[str, str] = {}   # model -> UTC date its daily quota ran 
 _last_request_at = 0.0
 
 
-def _api_key() -> str | None:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("API_KEY")
-
-
 def enabled_for(lang: str) -> bool:
-    return lang in GEMINI_TTS_LANGS and bool(_api_key()) and bool(GEMINI_TTS_MODELS)
+    return lang in GEMINI_TTS_LANGS and bool(gemini_models.api_key()) and bool(gemini_models.tts_models())
 
 
 def make_chunks(lines: list[tuple[str, str]]) -> list[list[int]]:
@@ -87,7 +83,7 @@ def _request_body(lines: list[tuple[str, str]], lang: str, tagged: bool) -> dict
             {"speaker": SPEAKER_NAMES[s], "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": VOICES[s]}}}
             for s in ("host1", "host2")]}}
         if tagged:
-            # gemini-3.8 requires every text part to carry its speaker, and
+            # some TTS models require every text part to carry its speaker, and
             # rejects untagged parts (so no separate style instruction).
             parts = [{"text": t, "speechMetadata": {"speaker": SPEAKER_NAMES[s]}} for s, t in lines]
         else:
@@ -101,14 +97,19 @@ def _call_model(model: str, lines: list[tuple[str, str]], lang: str) -> AudioSeg
     """One request (plus one retry with the other request format on a 400).
     Raises _QuotaExhausted on 429."""
     global _last_request_at
-    tagged = model.startswith("gemini-3.8")
+    tagged = gemini_models.tts_needs_tagged_parts(model)
     for _ in range(2):
         wait = MIN_REQUEST_GAP_SECONDS - (time.time() - _last_request_at)
         if wait > 0:
             time.sleep(wait)
         _last_request_at = time.time()
-        resp = requests.post(API_URL.format(model=model), params={"key": _api_key()},
+        # The key goes in a header: a query-string key ends up in any logged URL
+        # or requests exception message.
+        resp = requests.post(API_URL.format(model=model), headers={"x-goog-api-key": gemini_models.api_key()},
                              json=_request_body(lines, lang, tagged), timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code == 404:
+            gemini_models.mark_not_found(model)
+            return None
         if resp.status_code == 429:
             raise _QuotaExhausted(model)
         if resp.status_code == 400 and "speech_metadata" in resp.text and not tagged:
@@ -118,7 +119,7 @@ def _call_model(model: str, lines: list[tuple[str, str]], lang: str) -> AudioSeg
             tagged = False
             continue
         if resp.status_code != 200:
-            log.warning(f"Gemini TTS {model}: HTTP {resp.status_code} {resp.text[:200]}")
+            log.warning(f"Gemini TTS {model}: HTTP {resp.status_code}")
             return None
         try:
             inline = resp.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
@@ -181,7 +182,7 @@ def split_dialogue(audio: AudioSegment, texts: list[str]) -> list[AudioSegment] 
 def synthesize_chunk(lines: list[tuple[str, str]], lang: str) -> list[AudioSegment] | None:
     """lines: [(speaker, text)]. Returns one AudioSegment per line, or None."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    for model in GEMINI_TTS_MODELS:
+    for model in gemini_models.tts_models():
         if _exhausted_until.get(model) == today:
             continue
         try:
@@ -191,7 +192,7 @@ def synthesize_chunk(lines: list[tuple[str, str]], lang: str) -> list[AudioSegme
             log.warning(f"Gemini TTS {model}: daily free quota exhausted, trying the next model")
             continue
         except requests.RequestException as e:
-            log.warning(f"Gemini TTS {model}: request failed ({e})")
+            log.warning(f"Gemini TTS {model}: request failed ({type(e).__name__})")
             continue
         if audio is None:
             continue

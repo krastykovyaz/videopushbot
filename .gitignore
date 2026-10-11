@@ -1,5 +1,7 @@
 # Secrets & credentials — never commit
 .env
+.env.*
+!.env.example
 client_secret*.json
 *.pickle
 *.session
@@ -16,6 +18,8 @@ youtube_uploader_simple.py
 __pycache__/
 *.pyc
 venv/
+venv_old/
+venv_slim/
 .python-version
 
 # Logs
