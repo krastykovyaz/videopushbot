@@ -17,6 +17,7 @@ import logging
 import re
 import socket
 from pathlib import Path
+from html import unescape
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
@@ -32,6 +33,9 @@ _HEADERS = {
 }
 _MAX_IMAGES = 6
 _MIN_IMAGE_BYTES = 5000  # skip tiny icons/placeholders
+# Related-article strips and brand lists are full of 100-300 px thumbnails and
+# logos; shown full-screen they are a blown-up blur. Real article photos are larger.
+_MIN_IMAGE_W, _MIN_IMAGE_H = 400, 240
 _MAX_REDIRECTS = 3
 # Formats the frame/thumbnail renderer (PIL) can actually draw. SVG logos were
 # being saved as ".png" and then failing to load, wasting image slots.
@@ -80,7 +84,9 @@ def extract_webpage(url: str, job_dir: Path) -> list[dict]:
     resp.raise_for_status()
     html = resp.text
 
-    text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
+    # Tables carry the numbers (shares, volumes) that charts and the script need;
+    # without them an article whose data sits in a table loses all of it.
+    text = trafilatura.extract(html, include_comments=False, include_tables=True) or ""
     if not text.strip():
         raise ValueError(f"No article text found at {url} (trafilatura extraction empty)")
 
@@ -92,6 +98,18 @@ def extract_webpage(url: str, job_dir: Path) -> list[dict]:
 
     log.info(f"webpage_extract: {len(text)} chars text, {len(images)} images from {url}")
     return pages
+
+
+def _clean_caption(text) -> str:
+    """Image descriptions arrive with entities ("&nbsp;", sometimes double-escaped)
+    and stray whitespace; unescape until stable and collapse it."""
+    text = str(text or "")
+    for _ in range(3):
+        unescaped = unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+    return " ".join(text.replace("\xa0", " ").split())
 
 
 def _extract_images(html: str, page_url: str, img_dir: Path) -> list[dict]:
@@ -114,7 +132,7 @@ def _extract_images(html: str, page_url: str, img_dir: Path) -> list[dict]:
     for img in candidate_imgs:
         if idx >= _MAX_IMAGES:
             break
-        alt = (img.get("alt") or "").strip()
+        alt = _clean_caption(img.get("alt"))
         src = img.get("src") or img.get("data-src") or ""
         if not src or not alt:  # unlabeled images are almost always decorative chrome
             continue
@@ -140,7 +158,7 @@ def _extract_images(html: str, page_url: str, img_dir: Path) -> list[dict]:
             real_url = _resolve_image_url(meta["content"].strip(), page_url)
             if real_url:
                 title_meta = soup.find("meta", property="og:title")
-                caption = (title_meta.get("content").strip() if title_meta and title_meta.get("content") else "")
+                caption = _clean_caption(title_meta.get("content") if title_meta else "")
                 downloaded = _download_image(real_url, img_dir, 0)
                 if downloaded:
                     images.append({"path": downloaded, "caption": caption, "bbox_y": 0.0})
@@ -174,11 +192,14 @@ def _download_image(url: str, img_dir: Path, idx: int) -> str | None:
         try:
             with Image.open(io.BytesIO(data)) as im:
                 fmt = im.format
+                width, height = im.size
                 im.verify()
         except Exception:
             return None
         ext = _IMAGE_EXT.get(fmt)
         if not ext:
+            return None
+        if width < _MIN_IMAGE_W or height < _MIN_IMAGE_H:
             return None
         img_path = img_dir / f"web_{idx:02d}{ext}"
         img_path.write_bytes(data)

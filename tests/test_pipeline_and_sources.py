@@ -113,6 +113,15 @@ def test_svg_and_fake_images_are_skipped(tmp_path, monkeypatch):
     assert webpage_extract._download_image("https://x/lies.png", tmp_path, 0) is None   # header lies
 
 
+def test_thumbnails_and_logos_are_not_used_as_pictures(tmp_path, monkeypatch):
+    from common import webpage_extract
+    import io
+    buf = io.BytesIO(); Image.new("RGB", (192, 176)).save(buf, "PNG", compress_level=0)
+    data = buf.getvalue() + b"\x00" * 6000                              # big enough to pass the byte-size check
+    monkeypatch.setattr(webpage_extract, "_safe_get", lambda url, **k: _Resp(data, "image/png"))
+    assert webpage_extract._download_image("https://x/logo.png", tmp_path, 0) is None
+
+
 def test_real_image_saved_with_its_true_extension(tmp_path, monkeypatch):
     from common import webpage_extract
     import io
@@ -147,3 +156,11 @@ def test_jpmorgan_marker_ignores_error_pages(monkeypatch):
     assert pdf_source.get_pdf_change_marker("https://x/brief.pdf") is None
     monkeypatch.setattr(pdf_source.requests, "head", lambda *a, **k: R(200, "application/pdf"))
     assert pdf_source.get_pdf_change_marker("https://x/brief.pdf").startswith('"e1"')
+
+
+def test_captions_are_unescaped_and_tidied():
+    from common.webpage_extract import _clean_caption
+    assert _clean_caption("Рынок&nbsp;новых автомобилей") == "Рынок новых автомобилей"
+    assert _clean_caption("Рынок&amp;nbsp;новых  автомобилей\n") == "Рынок новых автомобилей"   # double-escaped
+    assert _clean_caption("A B &quot;x&quot;") == 'A B "x"'
+    assert _clean_caption(None) == ""

@@ -205,3 +205,39 @@ def test_tts_404_model_is_skipped_for_an_hour(monkeypatch):
     first = list(calls)
     assert gemini_tts.synthesize_chunk(lines, "ru") is None
     assert calls == first and first == gm.DEFAULT_TTS_MODELS            # each tried once, then skipped
+
+
+def test_json_mode_requests_valid_json_and_a_big_output_budget(monkeypatch):
+    seen = {}
+    def post(url, headers=None, json=None, timeout=None):
+        seen["body"] = json
+        return Resp(200, '{"a": 1}', version="gemini-2.5-flash")
+    monkeypatch.setattr(gm.requests, "post", post)
+    gm.generate_text("x", api_key=KEY, json_mode=True)
+    assert seen["body"]["generationConfig"]["responseMimeType"] == "application/json"
+    assert seen["body"]["generationConfig"]["maxOutputTokens"] >= 8192
+    gm.generate_text("x", api_key=KEY)
+    assert "generationConfig" not in seen["body"]                     # plain calls are unchanged
+
+
+def test_excluded_models_are_skipped(monkeypatch):
+    calls = fake_api(monkeypatch, lambda m: Resp(200, "ok", version=m))
+    assert gm.generate_text("x", api_key=KEY, exclude={"gemini-2.5-flash"}).requested == "gemini-3.8-flash"
+    assert "gemini-2.5-flash" not in calls
+    with pytest.raises(gm.GeminiError):
+        gm.generate_text("x", api_key=KEY, exclude=set(gm.DEFAULT_TEXT_CHAIN))
+
+
+def test_script_generation_tries_another_model_when_json_is_invalid(tmp_path, monkeypatch):
+    import asyncio
+    from pipeline import step02_script as s2
+    answers = {"gemini-2.5-flash": "{ not json", "gemini-3.8-flash": '{"title": "T", "key_points": [], "segments": []}'}
+    seen = []
+    def fake(prompt, api_key=None, preferred=None, timeout=60, json_mode=False, exclude=frozenset()):
+        assert json_mode is True
+        model = next(m for m in gm.DEFAULT_TEXT_CHAIN if m not in exclude)
+        seen.append(model)
+        return gm.GeminiResult(text=answers.get(model, "{}"), requested=model, answered=model)
+    monkeypatch.setattr(s2.gemini_models, "generate_text", fake)
+    script = asyncio.run(s2.generate_script([{"page": 0, "text": "some article text", "images": []}], tmp_path, "ru"))
+    assert seen == ["gemini-2.5-flash", "gemini-3.8-flash"] and script["title"] == "T"

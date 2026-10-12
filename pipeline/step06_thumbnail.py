@@ -129,6 +129,8 @@ def _find_best_image(blocks: list[dict]):
     """Найти первое подходящее изображение (не слишком маленькое)."""
     for block in blocks:
         for img in block.get("images", []):
+            if img.get("kind") == "chart":
+                continue
             p = img.get("path")
             if p and Path(p).exists():
                 try:

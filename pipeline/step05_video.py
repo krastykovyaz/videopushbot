@@ -38,40 +38,45 @@ def build_video(frames_dir: Path, timeline: list[dict], job_dir: Path) -> Path:
 
 
 def _write_concat(timeline: list[dict], frames_dir: Path, concat_path: Path):
-    """Записать ffmpeg concat-файл с длительностью каждого кадра."""
-    lines = []
-    valid_entries = []
-
+    """Записать ffmpeg concat-файл. Реплика может состоять из нескольких кадров
+    (фрагменты субтитров, entry["frames"]) — их длительности в сумме дают
+    длительность реплики, так что звук не рассинхронизируется."""
+    pieces = []                       # (frame path, seconds)
     previous = None
     for entry in timeline:
-        frame = Path(entry.get("frame_path") or frames_dir / f"frame_{entry['seg_id']:04d}.png")
-        if not frame.exists():
-            # Skipping the frame (old behaviour) shifted every later slide earlier
-            # than its audio. Hold the previous slide for this segment's duration.
-            if previous is None:
-                log.warning(f"Кадр не найден: {frame}, пропускаю (нет предыдущего кадра)")
-                continue
-            log.warning(f"Кадр не найден: {frame}, показываю предыдущий кадр")
-            frame = previous
-        previous = frame
-        valid_entries.append((frame, entry))
-    if not valid_entries:
+        frames = entry.get("frames") or [{
+            "path": entry.get("frame_path") or str(frames_dir / f"frame_{entry['seg_id']:04d}.png"),
+            "duration_ms": entry["duration_ms"],
+        }]
+        for k, fr in enumerate(frames):
+            frame = Path(fr["path"])
+            if not frame.exists():
+                # Skipping the frame shifts every later slide earlier than its audio.
+                # Hold the previous slide for this frame's duration instead.
+                if previous is None:
+                    log.warning(f"Кадр не найден: {frame}, пропускаю (нет предыдущего кадра)")
+                    continue
+                log.warning(f"Кадр не найден: {frame}, показываю предыдущий кадр")
+                frame = previous
+            previous = frame
+            seconds = fr["duration_ms"] / 1000.0
+            if k == len(frames) - 1:
+                seconds += 0.3        # the pause the audio inserts between replies
+            pieces.append((frame, seconds))
+    if not pieces:
         raise RuntimeError(f"Нет ни одного кадра в {frames_dir}")
 
-    for i, (frame, entry) in enumerate(valid_entries):
-        duration_sec = entry["duration_ms"] / 1000.0 + 0.3
+    lines = []
+    for frame, seconds in pieces:
         lines.append(f"file '{frame.resolve()}'")
-        lines.append(f"duration {duration_sec:.3f}")
-
+        lines.append(f"duration {seconds:.3f}")
     # Последний кадр повторяем без duration (требование ffmpeg concat)
-    if valid_entries:
-        last_frame = valid_entries[-1][0]
-        lines.append(f"file '{last_frame.resolve()}'")
+    lines.append(f"file '{pieces[-1][0].resolve()}'")
 
     with open(concat_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    log.info(f"Concat файл: {len(valid_entries)} кадров → {concat_path}")
+    log.info(f"Concat файл: {len(pieces)} кадров → {concat_path}")
 
 
 def _run_ffmpeg(concat_path: Path, audio_path: Path, output_path: Path, timeout: int = 600):

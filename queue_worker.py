@@ -97,6 +97,7 @@ async def run_pipeline(job: Job) -> tuple[Path, Path]:
     Возвращает (video_path, thumbnail_path).
     """
     from pipeline.step01_extract  import extract_pdf
+    from pipeline.charts          import add_chart_images
     from pipeline.step02_script   import generate_script
     from pipeline.step03_tts      import generate_tts
     from pipeline.step04_frames   import build_frames
@@ -118,6 +119,14 @@ async def run_pipeline(job: Job) -> tuple[Path, Path]:
         n_pages = len(blocks)
         n_imgs  = sum(len(b.get("images", [])) for b in blocks)
         await p(cid, f"✅ Шаг 1/6 — извлечено: {n_pages} стр., {n_imgs} изображений")
+
+    # Графики по цифрам статьи (необязательно: любая ошибка — видео просто без графиков)
+    try:
+        blocks, n_charts = await asyncio.to_thread(add_chart_images, blocks, d, job.lang)
+        if n_charts:
+            await p(cid, f"📊 Графики из данных статьи: {n_charts}")
+    except Exception as e:
+        log.warning(f"графики пропущены: {e}")
 
     # Шаг 2 — Скрипт
     await p(cid, "⏳ Шаг 2/6 — генерирую скрипт диалога (LLM)...")

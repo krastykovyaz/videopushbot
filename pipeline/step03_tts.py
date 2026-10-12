@@ -117,6 +117,7 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
             "wav_path":      str(wav_path),
             "image_path":    seg.get("image_path"),
             "image_caption": seg.get("image_caption", ""),
+            "image_kind":    seg.get("image_kind"),
         })
 
         # Нормализовать громкость сегмента перед склейкой

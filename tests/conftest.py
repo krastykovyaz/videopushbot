@@ -4,7 +4,10 @@ state JSON files, YouTube/VK clients). Run everything inside a throwaway
 directory with stub credentials so the real session, tokens and state files
 are never touched and no network login happens.
 """
+import asyncio
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -13,6 +16,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SANDBOX = Path(tempfile.mkdtemp(prefix="videopushbot-tests-"))
+atexit.register(shutil.rmtree, SANDBOX, ignore_errors=True)
 
 # load_dotenv() never overrides variables that are already set, so these win.
 os.environ.update({
@@ -30,6 +34,12 @@ os.chdir(SANDBOX)
 
 @pytest.fixture
 def bot_mod():
+    # bot.py builds a Telegram client at import, which needs an event loop on the
+    # main thread; an earlier test's asyncio.run() leaves none behind.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     import bot
     bot.deferred_publishes.clear()
     bot.last_result.clear()

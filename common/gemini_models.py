@@ -116,7 +116,7 @@ def _clean(names: list[str]) -> list[str]:
     return out
 
 
-def text_chain(preferred: str | None = None) -> list[str]:
+def text_chain(preferred: str | None = None, exclude=frozenset()) -> list[str]:
     """Ordered models to try for one request: the preferred one first (when it
     is a stable model), then the rest; previews always last; models that
     returned 404 recently are skipped."""
@@ -126,7 +126,7 @@ def text_chain(preferred: str | None = None) -> list[str]:
     ordered = [m for m in names if not is_preview(m)] + [m for m in names if is_preview(m)]
     now = time.time()
     with _lock:
-        return [m for m in ordered if _unavailable_until.get(m, 0) <= now]
+        return [m for m in ordered if _unavailable_until.get(m, 0) <= now and m not in exclude]
 
 
 def tts_models() -> list[str]:
@@ -157,12 +157,18 @@ def _error_message(resp) -> str:
         return (resp.text or "")[:200]
 
 
-def _generate_one(model: str, prompt: str, key: str, timeout: int) -> GeminiResult:
+def _generate_one(model: str, prompt: str, key: str, timeout: int, json_mode: bool = False) -> GeminiResult:
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    if json_mode:
+        # JSON mode guarantees syntactically valid JSON (weaker models otherwise
+        # sometimes emit unescaped quotes or stop mid-object); the large output
+        # budget keeps a long script from being cut off.
+        body["generationConfig"] = {"responseMimeType": "application/json", "maxOutputTokens": 16384}
     try:
         resp = requests.post(
             f"{API_ROOT}/{model}:generateContent",
             headers={"x-goog-api-key": key},
-            json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+            json=body,
             timeout=timeout,
         )
     except requests.RequestException as e:
@@ -190,20 +196,21 @@ def _generate_one(model: str, prompt: str, key: str, timeout: int) -> GeminiResu
 
 
 def generate_text(prompt: str, api_key: str | None = None, preferred: str | None = None,
-                  timeout: int = 60) -> GeminiResult:
+                  timeout: int = 60, json_mode: bool = False, exclude=frozenset()) -> GeminiResult:
     """Tries the chain in order; returns the first answer, saying which model
-    really gave it. Raises the last error if every model fails."""
+    really gave it. `exclude` skips models the caller already got an unusable
+    answer from. Raises the last error if every model fails."""
     key = api_key or globals()["api_key"]()
     if not key:
         raise GeminiError("no Gemini API key configured")
-    chain = text_chain(preferred)
+    chain = text_chain(preferred, exclude)
     if not chain:
         raise GeminiError("no Gemini model is currently available")
 
     last_err: Exception | None = None
     for model in chain:
         try:
-            result = _generate_one(model, prompt, key, timeout)
+            result = _generate_one(model, prompt, key, timeout, json_mode)
         except GeminiNotFound as e:
             mark_not_found(model)
             last_err = e

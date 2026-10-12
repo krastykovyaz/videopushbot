@@ -54,7 +54,8 @@ PROMPTS = {
 }}
 
 image_index — индекс из списка изображений (0-based), или -1 если нет подходящего.
-Равномерно распредели изображения по сегментам.
+Равномерно распредели изображения по сегментам. Изображения с подписью «График: …» — это
+графики по цифрам самой статьи: показывай такой график в тех репликах, где обсуждаются его цифры.
 
 МАТЕРИАЛ СТАТЬИ:
 {content}
@@ -94,7 +95,8 @@ RESPONSE FORMAT — strict JSON, no markdown:
 }}
 
 image_index — index from the images list (0-based), or -1 if none fits.
-Distribute images evenly across segments.
+Distribute images evenly across segments. Images captioned "Chart: ..." are charts built from the
+article's own numbers: show one in the segments where the hosts discuss those numbers.
 
 ARTICLE CONTENT:
 {content}
@@ -194,11 +196,19 @@ async def generate_script(blocks: list[dict], job_dir: Path, lang: str = "ru") -
     short_text = (full_text[:6000] + "\n... [текст сокращён]") if len(full_text) > 6000 else full_text
     prompt_short = PROMPTS[lang].format(content=short_text, images=images_str)
 
-    # Сначала пробуем Gemini, при ошибке — Groq
-    response_text = await _call_gemini_then_groq(prompt_full, prompt_short, lang)
-
-    script = _parse_json(response_text)
-
+    # Сначала пробуем Gemini, при ошибке — Groq. Если модель вернула
+    # непарсящийся JSON — пробуем следующую модель, а не роняем задачу.
+    tried: set[str] = set()
+    for attempt in range(3):
+        response_text, answered = await _call_gemini_then_groq(prompt_full, prompt_short, lang, tried)
+        try:
+            script = _parse_json(response_text)
+            break
+        except ValueError as e:
+            if answered == "groq" or attempt == 2:
+                raise
+            log.warning(f"{answered}: невалидный JSON ({str(e)[:80]}), пробую другую модель")
+            tried.add(answered)
     # Жёсткая обрезка по языку — целимся в ~7 минут итогового видео.
     # Ранее здесь стояло 3500/3800: даже сценарий из 2628 слов (в пределах
     # старого лимита) давал 17 минут видео вместо 7 — сам комментарий уже
@@ -217,6 +227,7 @@ async def generate_script(blocks: list[dict], job_dir: Path, lang: str = "ru") -
         if 0 <= idx < len(flat_images):
             seg["image_path"] = flat_images[idx]["path"]
             seg["image_caption"] = flat_images[idx]["caption"]
+            seg["image_kind"] = flat_images[idx].get("kind")
         else:
             seg["image_path"] = None
             seg["image_caption"] = ""
@@ -230,15 +241,17 @@ async def generate_script(blocks: list[dict], job_dir: Path, lang: str = "ru") -
     return script
 
 
-async def _call_gemini_then_groq(prompt_full: str, prompt_short: str, lang: str) -> str:
+async def _call_gemini_then_groq(prompt_full: str, prompt_short: str, lang: str,
+                                 exclude=frozenset()) -> tuple[str, str]:
     """Перебирает модели Gemini по очереди (у каждой свой лимит квоты).
     Если ни одна не сработала — Groq с коротким промптом."""
     try:
         result = await asyncio.to_thread(
             gemini_models.generate_text, prompt_full,
-            api_key=os.getenv("GEMINI_API_KEY") or gemini_models.api_key(), timeout=60)
+            api_key=os.getenv("GEMINI_API_KEY") or gemini_models.api_key(), timeout=90,
+            json_mode=True, exclude=exclude)
         log.info(f"Gemini {result.answered}: успешно")
-        return result.text
+        return result.text, result.requested
     except Exception as e:
         last_err = e
     log.warning(f"Все модели Gemini недоступны (последняя ошибка: {str(last_err)[:120]}), переключаюсь на Groq...")
@@ -249,7 +262,7 @@ async def _call_gemini_then_groq(prompt_full: str, prompt_short: str, lang: str)
             "Получи ключ на https://console.groq.com и добавь в .env"
         )
     log.info(f"Groq промпт: {len(prompt_short)} символов")
-    return await _call_groq(prompt_short, lang)
+    return await _call_groq(prompt_short, lang), "groq"
 
 
 async def _call_groq(prompt: str, lang: str) -> str:
