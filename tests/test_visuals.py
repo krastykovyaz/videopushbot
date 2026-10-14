@@ -159,3 +159,105 @@ def test_concat_uses_every_frame_with_the_same_total_time(tmp_path):
     durations = [float(l.split()[1]) for l in (tmp_path / "concat.txt").read_text().splitlines() if l.startswith("duration")]
     assert durations == [2.0, 4.3, 3.3]                                   # +0.3 s pause only after each reply
     assert abs(sum(durations) - (6 + 3 + 0.6)) < 1e-9
+
+
+# ── paper figures: extraction and camera zoom ─────────────────────────────────
+def _paper_pdf(path, figures=1, pages=1):
+    import fitz
+    doc = fitz.open()
+    for p in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((60, 70), "Introduction. " + "Some body text of the paper. " * 4, fontsize=10)
+        for f in range(figures):
+            y = 120 + f * 300
+            for i in range(5):                                    # a boxes-and-arrows diagram
+                page.draw_rect(fitz.Rect(70 + i * 95, y, 135 + i * 95, y + 60), color=(0, 0, 0.6), fill=(0.8, 0.9, 1))
+                if i:
+                    page.draw_line((70 + i * 95 - 30, y + 30), (70 + i * 95, y + 30), color=(0, 0, 0))
+            page.draw_rect(fitz.Rect(70, y + 90, 500, y + 170), color=(0.6, 0, 0), fill=(1, 0.9, 0.9))
+            page.insert_text((70, y + 195), f"Fig. {f + 1}. Pipeline of the dispatch system", fontsize=9)
+    doc.save(str(path))
+    return path
+
+
+def test_vector_figure_is_cropped_with_its_caption(tmp_path):
+    from pipeline import step01_extract
+    pages = step01_extract.extract_pdf(_paper_pdf(tmp_path / "paper.pdf", figures=3), tmp_path / "job")
+    images = [i for p in pages for i in p["images"]]
+    figures = [i for i in images if i["kind"] == "figure"]
+    assert len(figures) >= 3
+    assert all(Image.open(i["path"]).width >= 1500 for i in figures)       # sharp enough to zoom into
+    assert any("Pipeline of the dispatch" in i["caption"] for i in figures)
+    assert not any(i["kind"] == "page" for i in images)                    # enough figures: no whole-page fallback
+
+
+def test_paper_without_figures_falls_back_to_scrolled_pages(tmp_path):
+    import fitz
+    from pipeline import step01_extract
+    doc = fitz.open()
+    for _ in range(4):                                                     # text pages with only tiny rules/bullets
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((60, 70), "Body text of the paper. " * 6, fontsize=10)
+        for i in range(14):
+            page.draw_rect(fitz.Rect(60, 150 + i * 40, 70, 160 + i * 40), color=(0, 0, 0), fill=(0, 0, 0))
+    doc.save(str(tmp_path / "text.pdf"))
+    pages = step01_extract.extract_pdf(tmp_path / "text.pdf", tmp_path / "job")
+    images = [i for p in pages for i in p["images"]]
+    assert len(images) == step01_extract.MIN_VISUALS
+    assert {i["kind"] for i in images} == {"page"} and all(i["caption"].startswith("Страница") for i in images)
+
+
+def _zoom_source(tmp_path, size, name="z.png"):
+    img = Image.new("RGB", size, (255, 255, 255))
+    for x in range(100, size[0] - 100, 60):                                # some content to bound
+        for y in range(100, size[1] - 100, 60):
+            img.paste((20, 20, 120), (x, y, x + 30, y + 30))
+    path = tmp_path / name
+    img.save(path)
+    return str(path)
+
+
+def test_figure_camera_starts_whole_then_zooms_and_travels(tmp_path):
+    cam = s4._Camera(_zoom_source(tmp_path, (2800, 900)), "figure")
+    first = cam.view_rect(0, 5)
+    later = [cam.view_rect(k, 5) for k in range(1, 5)]
+    assert first[4] < later[0][4]                                          # zoomed in after the first window
+    assert abs(later[-1][4] / first[4] - s4.ZOOM_MAX) < 1e-6
+    xs = [(r[0] + r[2]) / 2 for r in later]
+    assert xs == sorted(xs) and xs[-1] - xs[0] > 100                       # sweeps along the long side
+    bx0, by0, bx1, by1 = cam.box
+    for r in [first] + later:                                              # the view never leaves the content
+        assert (r[0] >= bx0 - 1e-6 and r[2] <= bx1 + 1e-6) or r[2] - r[0] >= bx1 - bx0   # inside, or centred when larger
+        assert (r[1] >= by0 - 1e-6 and r[3] <= by1 + 1e-6) or r[3] - r[1] >= by1 - by0
+
+
+def test_page_camera_scrolls_top_to_bottom_at_a_fixed_scale(tmp_path):
+    cam = s4._Camera(_zoom_source(tmp_path, (1900, 2500)), "page")
+    views = [cam.view_rect(k, 6) for k in range(6)]
+    assert len({round(v[4], 6) for v in views}) == 1
+    ys = [v[1] for v in views]
+    assert ys == sorted(ys) and ys[-1] > ys[0]
+    assert abs(views[-1][3] - cam.box[3]) < 1.0                            # ends at the bottom of the content
+    assert views[0][4] <= s4.PAGE_MAX_SCALE
+
+
+def test_camera_render_fills_the_visual_area(tmp_path):
+    for kind, size in (("figure", (2800, 900)), ("page", (1900, 2500))):
+        cam = s4._Camera(_zoom_source(tmp_path, size, kind + ".png"), kind)
+        for k in (0, 2, 4):
+            assert cam.render(k, 5).size == (s4.VIS_W, s4.VIS_H)
+
+
+def test_paper_figure_frames_change_per_window_and_zoom_can_be_disabled(tmp_path, monkeypatch):
+    path = _zoom_source(tmp_path, (2800, 900))
+    tl = _timeline(path, "figure")
+    (tmp_path / "on").mkdir()
+    s4.build_frames({"title": "T", "key_points": ["x"]}, tl, tmp_path / "on", "ru")
+    shots = {_visual({"frames": [f]}).tobytes() for f in tl[0]["frames"]}
+    assert len(tl[0]["frames"]) > 2 and len(shots) == len(tl[0]["frames"])  # a different view in every window
+
+    monkeypatch.setattr(s4, "ZOOM_MAX", 1.0)
+    tl_off = _timeline(path, "figure")
+    (tmp_path / "off").mkdir()
+    s4.build_frames({"title": "T", "key_points": ["x"]}, tl_off, tmp_path / "off", "ru")
+    assert len({_visual({"frames": [f]}).tobytes() for f in tl_off[0]["frames"]}) == 1   # static, as before

@@ -17,7 +17,7 @@ import logging
 import os
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 log = logging.getLogger("step04")
 
@@ -32,6 +32,12 @@ SUB_SIZE, LINE_H = 44, 58
 DIM = (125, 125, 145)
 MIN_CHUNK_SECONDS = 1.0
 COVER_MIN_ASPECT = 1.9        # wide images fill the area; others sit on a blurred backdrop
+
+# Figures and pages taken from papers are zoomed in steps across the subtitle
+# lines of the reply that shows them (1.0 switches zooming off).
+ZOOM_KINDS = {"figure", "page"}
+ZOOM_MAX = float(os.getenv("VISUAL_ZOOM_MAX", "1.5"))
+PAGE_MAX_SCALE = 3.0
 
 BG_COLOR   = (12, 12, 18)
 PANEL_FILL = (22, 22, 32)
@@ -145,6 +151,16 @@ def _rounded(im: Image.Image, radius: int) -> Image.Image:
 
 
 # ── Область визуала ──────────────────────────────────────────────────────────
+def _backdrop(img: Image.Image) -> Image.Image:
+    """Blurred, darkened copy of the picture filling the visual area."""
+    iw, ih = img.size
+    cover = max(VIS_W / iw, VIS_H / ih)
+    back = img.resize((int(iw * cover) + 1, int(ih * cover) + 1), Image.BILINEAR)
+    left, top = (back.width - VIS_W) // 2, (back.height - VIS_H) // 2
+    back = back.crop((left, top, left + VIS_W, top + VIS_H)).filter(ImageFilter.GaussianBlur(30))
+    return Image.eval(back, lambda v: int(v * 0.4))
+
+
 def _visual_from_image(path: str) -> Image.Image:
     img = Image.open(path).convert("RGB")
     iw, ih = img.size
@@ -155,15 +171,81 @@ def _visual_from_image(path: str) -> Image.Image:
         return img.crop((left, top, left + VIS_W, top + VIS_H))
     # Tall or square pictures (figures, diagrams, portraits) must not be cropped:
     # show them whole, centred over a blurred, darkened copy of themselves.
-    cover = max(VIS_W / iw, VIS_H / ih)
-    back = img.resize((int(iw * cover) + 1, int(ih * cover) + 1), Image.BILINEAR)
-    left, top = (back.width - VIS_W) // 2, (back.height - VIS_H) // 2
-    back = back.crop((left, top, left + VIS_W, top + VIS_H)).filter(ImageFilter.GaussianBlur(30))
-    back = Image.eval(back, lambda v: int(v * 0.4))
+    back = _backdrop(img)
     fit = min(VIS_W / iw, VIS_H / ih)
     front = img.resize((max(1, int(iw * fit)), max(1, int(ih * fit))), Image.LANCZOS)
     back.paste(front, ((VIS_W - front.width) // 2, (VIS_H - front.height) // 2))
     return back
+
+
+def _content_box(img: Image.Image) -> tuple[int, int, int, int]:
+    """Bounding box of everything that differs from the page background, so
+    white margins around a figure or page are not shown (or zoomed into)."""
+    bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+    mask = ImageChops.difference(img, bg).convert("L").point(lambda v: 255 if v > 24 else 0)
+    box = mask.getbbox()
+    if not box:
+        return 0, 0, img.width, img.height
+    pad_x, pad_y = int(img.width * 0.012), int(img.height * 0.012)
+    return (max(0, box[0] - pad_x), max(0, box[1] - pad_y),
+            min(img.width, box[2] + pad_x), min(img.height, box[3] + pad_y))
+
+
+def _clamp_center(center: float, view: float, lo: float, hi: float) -> float:
+    if view >= hi - lo:                 # the view is larger than the content: centre it
+        return (lo + hi) / 2
+    return min(max(center, lo + view / 2), hi - view / 2)
+
+
+class _Camera:
+    """A virtual camera over one paper figure or page. Window k of n (one per
+    subtitle line) gets its own view: a figure starts whole, then zooms in and
+    tours along its long side so details appear while the hosts talk about them;
+    a text page scrolls from top to bottom at a readable size."""
+
+    def __init__(self, path: str, kind: str):
+        self.kind = kind
+        self.src = Image.open(path).convert("RGB")
+        self.box = _content_box(self.src)
+        self.backdrop = _backdrop(self.src)
+
+    def view_rect(self, k: int, n: int) -> tuple[float, float, float, float, float]:
+        """(x0, y0, x1, y1, scale) of the view in source pixels for window k of n."""
+        bx0, by0, bx1, by1 = self.box
+        cw, ch = bx1 - bx0, by1 - by0
+        if self.kind == "page":
+            scale = min(VIS_W / cw * 0.98, PAGE_MAX_SCALE)
+            vw, vh = VIS_W / scale, VIS_H / scale
+            t = k / (n - 1) if n > 1 else 0.0
+            cx = _clamp_center((bx0 + bx1) / 2, vw, bx0, bx1)
+            cy = _clamp_center(by0 + vh / 2 + max(0.0, ch - vh) * t, vh, by0, by1)
+        else:
+            fit = min(VIS_W / cw, VIS_H / ch)
+            zoom = 1.0 if (k == 0 or n == 1) else ZOOM_MAX
+            scale = fit * zoom
+            vw, vh = VIS_W / scale, VIS_H / scale
+            cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+            if zoom > 1.0:
+                steps = n - 1
+                t = (k - 1) / (steps - 1) if steps > 1 else 0.5
+                travel_x, travel_y = max(0.0, cw - vw), max(0.0, ch - vh)
+                if travel_x >= travel_y and travel_x > 0:
+                    cx = bx0 + vw / 2 + travel_x * t
+                elif travel_y > 0:
+                    cy = by0 + vh / 2 + travel_y * t
+            cx = _clamp_center(cx, vw, bx0, bx1)
+            cy = _clamp_center(cy, vh, by0, by1)
+        return cx - vw / 2, cy - vh / 2, cx + vw / 2, cy + vh / 2, scale
+
+    def render(self, k: int, n: int) -> Image.Image:
+        vx0, vy0, vx1, vy1, scale = self.view_rect(k, n)
+        bx0, by0, bx1, by1 = self.box
+        ix0, iy0, ix1, iy1 = max(vx0, bx0), max(vy0, by0), min(vx1, bx1), min(vy1, by1)
+        canvas = self.backdrop.copy()
+        w, h = max(1, round((ix1 - ix0) * scale)), max(1, round((iy1 - iy0) * scale))
+        piece = self.src.resize((w, h), Image.LANCZOS, box=(ix0, iy0, ix1, iy1))
+        canvas.paste(piece, (round((ix0 - vx0) * scale), round((iy0 - vy0) * scale)))
+        return canvas
 
 
 def _visual_key_points(title: str, key_points: list[str], fonts: dict, lang: str) -> Image.Image:
@@ -273,6 +355,7 @@ def build_frames(script: dict, timeline: list[dict], job_dir: Path, lang: str = 
     measure = _measure()
 
     last_photo = None        # (path, caption): a photo stays up until the next one replaces it
+    cameras: dict[str, _Camera] = {}
     for entry in timeline:
         path, caption, kind = entry.get("image_path"), entry.get("image_caption", ""), entry.get("image_kind")
         if path and Path(str(path)).exists():
@@ -291,24 +374,32 @@ def build_frames(script: dict, timeline: list[dict], job_dir: Path, lang: str = 
         seg_key = hashlib.sha1("|".join(str(x) for x in (lang, title, path, caption, kind,
                                                          tuple(key_points))).encode("utf-8")).hexdigest()[:8]
 
+        zoom = (kind in ZOOM_KINDS and ZOOM_MAX > 1.0 and bool(path) and Path(str(path)).exists())
         base = None
         elapsed = 0
         frames = []
         for idx, ((prev_line, cur_line), dur) in enumerate(zip(windows, durations)):
             progress = (entry.get("start_ms", 0) + elapsed + dur / 2) / total_ms if total_ms else 0.0
-            key = hashlib.sha1(f"{seg_key}|{entry['speaker']}|{prev_line}|{cur_line}|{round(progress * 200)}".encode("utf-8")).hexdigest()[:10]
+            key = hashlib.sha1(f"{seg_key}|{entry['speaker']}|{prev_line}|{cur_line}|{round(progress * 200)}|{kind if zoom else ''}|{idx}/{len(windows)}|{ZOOM_MAX if zoom else ''}".encode("utf-8")).hexdigest()[:10]
             frame_path = frames_dir / f"frame_{entry['seg_id']:04d}_{idx:02d}_{key}.png"
             frames.append({"path": str(frame_path), "duration_ms": dur})
             elapsed += dur
             if frame_path.exists():
                 continue                                  # кэш
-            if base is None:
+            if base is None or zoom:
                 try:
-                    visual = _visual_from_image(str(path)) if path else _visual_key_points(title, key_points, fonts, lang)
+                    if zoom:
+                        cam = cameras.get(str(path)) or cameras.setdefault(str(path), _Camera(str(path), kind))
+                        visual = cam.render(idx, len(windows))
+                    else:
+                        visual = _visual_from_image(str(path)) if path else _visual_key_points(title, key_points, fonts, lang)
                 except Exception as e:
                     log.warning(f"Не удалось загрузить изображение {path}: {e}")
                     visual = _visual_key_points(title, key_points, fonts, lang)
-                base = _base_frame(visual, title, caption, kind != "chart" and bool(path), fonts)
+                # A zoomed figure is looked at closely, so its caption goes to the top bar
+                # instead of an overlay chip that would cover part of the picture.
+                top_text = " ".join(caption.split()) if (zoom and caption) else title
+                base = _base_frame(visual, top_text, caption, kind != "chart" and bool(path) and not zoom, fonts)
             img = _draw_chunk(base, entry["speaker"], labels.get(entry["speaker"], entry["speaker"]),
                               prev_line, cur_line, progress, fonts)
             # Write-then-rename: a process killed mid-save must not leave a
