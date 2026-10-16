@@ -26,6 +26,7 @@ import config_ru2
 from common.gemini_client import GeminiContentGenerator, append_footer
 from common.metadata import load_script_title_and_points
 from common.patreon_post import format_patreon_post
+from common.djvu import DjvuError, djvu_to_pdf
 from common.pdf_source import download_pdf, is_suitable_pdf_url, get_pdf_change_marker
 from common.vk_uploader import VKUploader
 from common.webpage_extract import (
@@ -109,7 +110,9 @@ ALLOWED_USERS = set(int(x) for x in _raw.split(",") if x) if _raw else None
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 # ── Клиент и очередь ────────────────────────────────────────────────────────
-client    = TelegramClient("notebooklm_session", API_ID, API_HASH)
+# catch_up=True: messages that arrived while the bot was down (server outage,
+# restart) are delivered on the next start instead of being lost.
+client    = TelegramClient("notebooklm_session", API_ID, API_HASH, catch_up=True)
 job_queue = JobQueue(max_workers=MAX_WORKERS)
 
 def _atomic_write(path: Path, text: str):
@@ -119,6 +122,33 @@ def _atomic_write(path: Path, text: str):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
+
+
+HANDLED_MESSAGES_FILE = Path("handled_messages.json")
+HANDLED_MESSAGES_KEEP = 500
+handled_messages: list = []          # ["chat_id:msg_id", ...], oldest first
+
+
+def _load_handled_messages() -> list:
+    if HANDLED_MESSAGES_FILE.exists():
+        try:
+            return [str(x) for x in json.loads(HANDLED_MESSAGES_FILE.read_text())][-HANDLED_MESSAGES_KEEP:]
+        except Exception as e:
+            log.warning(f"handled_messages.json: не удалось прочитать ({e}), начинаю с пустого")
+    return []
+
+
+def claim_message(chat_id, msg_id) -> bool:
+    """True the first time a message is seen. Catch-up after a crash can replay
+    a message the bot already handled (the session's update state is only saved
+    on a clean disconnect), so every incoming message is claimed before it runs."""
+    key = f"{chat_id}:{msg_id}"
+    if key in handled_messages:
+        return False
+    handled_messages.append(key)
+    del handled_messages[:-HANDLED_MESSAGES_KEEP]
+    _atomic_write(HANDLED_MESSAGES_FILE, json.dumps(handled_messages))
+    return True
 
 
 def _load_processed_arxiv() -> dict:
@@ -267,6 +297,7 @@ def _mark_checked(name: str):
 
 
 checker_last_run = _load_checker_state()
+handled_messages = _load_handled_messages()
 processed_coindesk_urls = _load_processed_coindesk()
 processed_ru_auto_urls  = _load_processed_ru_auto()
 processed_quarterly_digest_urls = _load_processed_quarterly_digest()
@@ -412,6 +443,10 @@ async def handle_message(event):
         await event.reply("⛔ Нет доступа.")
         return
 
+    if not claim_message(event.chat_id, event.id):
+        log.info(f"Сообщение {event.chat_id}:{event.id} уже обрабатывалось — пропускаю (повтор после перезапуска)")
+        return
+
     # /start /help
     if event.text and event.text.strip() in ("/start", "/help"):
         await event.reply(
@@ -503,17 +538,30 @@ async def handle_message(event):
             if hasattr(attr, "file_name"):
                 fname = attr.file_name or ""
 
-        if "pdf" not in mime.lower() and not fname.lower().endswith(".pdf"):
-            await event.reply("❌ Пожалуйста, отправь PDF-файл.")
+        is_djvu = "djvu" in mime.lower() or fname.lower().endswith((".djvu", ".djv"))
+        if not is_djvu and "pdf" not in mime.lower() and not fname.lower().endswith(".pdf"):
+            await event.reply("❌ Пожалуйста, отправь PDF- или DjVu-файл.")
             return
 
         job_id  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # microseconds: avoid
         job_dir = WORKSPACE / str(user_id) / job_id            # collisions across PDFs sent seconds apart
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        await event.reply("📥 Получил! Скачиваю PDF...")
+        await event.reply("📥 Получил! Скачиваю " + ("DjVu..." if is_djvu else "PDF..."))
         pdf_path = job_dir / "input.pdf"
-        await client.download_media(event.document, file=str(pdf_path))
+        if is_djvu:
+            djvu_path = job_dir / "input.djvu"
+            await client.download_media(event.document, file=str(djvu_path))
+            try:
+                await asyncio.to_thread(djvu_to_pdf, djvu_path, pdf_path)
+            except DjvuError as e:
+                await event.reply(f"❌ {e}")
+                return
+            finally:
+                djvu_path.unlink(missing_ok=True)
+            await event.reply("🔄 DjVu сконвертирован в PDF.")
+        else:
+            await client.download_media(event.document, file=str(pdf_path))
 
         await process_pdf(event.chat_id, user_id, pdf_path, job_dir)
         return

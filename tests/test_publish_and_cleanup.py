@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from conftest import make_job
 
 OK = {"success": True, "url": "https://example/v"}
@@ -185,3 +187,42 @@ def test_flush_loop_runs_immediately_when_woken(bot_mod, monkeypatch):
         loop_task.cancel()
     asyncio.run(scenario())
     assert seen == ["x"]
+
+
+# ── catch-up after downtime ───────────────────────────────────────────────────
+def test_a_replayed_message_is_claimed_only_once(bot_mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_mod, "HANDLED_MESSAGES_FILE", tmp_path / "handled.json")
+    monkeypatch.setattr(bot_mod, "handled_messages", [])
+    assert bot_mod.claim_message(1, 100) is True
+    assert bot_mod.claim_message(1, 100) is False            # replayed by catch-up after a crash
+    assert bot_mod.claim_message(1, 101) is True and bot_mod.claim_message(2, 100) is True
+    assert bot_mod._load_handled_messages() == ["1:100", "1:101", "2:100"]   # survives a restart
+
+
+def test_claimed_ids_are_capped(bot_mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_mod, "HANDLED_MESSAGES_FILE", tmp_path / "handled.json")
+    monkeypatch.setattr(bot_mod, "handled_messages", [])
+    for i in range(bot_mod.HANDLED_MESSAGES_KEEP + 20):
+        bot_mod.claim_message(1, i)
+    assert len(bot_mod.handled_messages) == bot_mod.HANDLED_MESSAGES_KEEP
+    assert bot_mod.claim_message(1, 0) is True               # forgotten long ago, so it would run again
+
+
+def test_djvu_without_the_converter_says_so(tmp_path, monkeypatch):
+    from common import djvu
+    monkeypatch.setattr(djvu.shutil, "which", lambda name: None)
+    with pytest.raises(djvu.DjvuError, match="ddjvu"):
+        djvu.djvu_to_pdf(tmp_path / "a.djvu", tmp_path / "a.pdf")
+
+
+def test_djvu_with_only_page_images_is_rejected(tmp_path, monkeypatch):
+    import fitz
+    from common import djvu
+    def fake_run(cmd, **kw):                                  # "ddjvu" writes a PDF with no text layer
+        doc = fitz.open(); doc.new_page(); doc.save(cmd[-1])
+        return type("P", (), {"returncode": 0, "stderr": ""})()
+    monkeypatch.setattr(djvu.shutil, "which", lambda name: "/usr/bin/ddjvu")
+    monkeypatch.setattr(djvu.subprocess, "run", fake_run)
+    with pytest.raises(djvu.DjvuError, match="текстового слоя"):
+        djvu.djvu_to_pdf(tmp_path / "a.djvu", tmp_path / "a.pdf")
+    assert not (tmp_path / "a.pdf").exists()
