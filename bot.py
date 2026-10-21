@@ -13,7 +13,7 @@ import shutil
 import logging
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -57,6 +57,10 @@ ARXIV_CHANNEL_RU = "arxivpaperu"
 # and EN each need their own video for the same paper, only reprocessing
 # within the SAME language should be prevented.
 PROCESSED_ARXIV_FILE = Path("processed_arxiv_papers.json")
+# Catch-up after a long outage replays every channel post from the gap. Papers
+# older than this are not worth a video any more, and one job per missed post
+# would flood the queue (and the Gemini quota) in one go.
+ARXIV_MAX_POST_AGE_HOURS = 72
 
 # Daily crypto-newsletter check: new articles get BOTH ru+en videos (this
 # content is never automotive, so the usual ru-only exception never applies).
@@ -656,6 +660,11 @@ def _extract_channel_description(raw_text: str, title: str) -> str:
 
 async def _process_arxiv_channel_post(event, channel_name: str, forced_langs: list):
     lang_key = forced_langs[0]  # each channel handler passes exactly one language
+    posted = event.message.date
+    if posted and datetime.now(timezone.utc) - posted > timedelta(hours=ARXIV_MAX_POST_AGE_HOURS):
+        log.info(f"@{channel_name} пост {event.message.id}: старше {ARXIV_MAX_POST_AGE_HOURS} ч "
+                 f"(догоняем после простоя), пропускаю")
+        return
     papers = _extract_papers(event)
     if not papers:
         log.info(f"@{channel_name} пост {event.message.id}: PDF-ссылки не найдены, пропускаю")
@@ -712,7 +721,10 @@ async def process_pdf(chat_id: int, user_id: int, pdf_path: Path, job_dir: Path,
     job_id = job_dir.name
 
     await client.send_message(chat_id, "🔎 Определяю тему и куда публиковать...")
-    blocks = await asyncio.to_thread(extract_pdf, pdf_path, job_dir / "sample")
+    # Text only: classification does not look at pictures, and rendering the
+    # figures of a magazine twice (here and again per language) was the slowest
+    # and most memory-hungry part of taking in a manual PDF.
+    blocks = await asyncio.to_thread(extract_pdf, pdf_path, job_dir / "sample", False)
     sample_text = "\n\n".join(b["text"] for b in blocks[:5])
     category = await asyncio.to_thread(
         gemini_ru.classify_topic, pdf_path.stem, sample_text, list(config_ru2.CONFIG["playlists"].keys()))

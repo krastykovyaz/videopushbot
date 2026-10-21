@@ -261,3 +261,10 @@ def test_paper_figure_frames_change_per_window_and_zoom_can_be_disabled(tmp_path
     (tmp_path / "off").mkdir()
     s4.build_frames({"title": "T", "key_points": ["x"]}, tl_off, tmp_path / "off", "ru")
     assert len({_visual({"frames": [f]}).tobytes() for f in tl_off[0]["frames"]}) == 1   # static, as before
+
+
+def test_text_only_extraction_renders_no_pictures(tmp_path):
+    from pipeline import step01_extract
+    pages = step01_extract.extract_pdf(_paper_pdf(tmp_path / "paper.pdf", figures=3), tmp_path / "job", with_images=False)
+    assert pages and all(p["images"] == [] for p in pages) and "Introduction" in pages[0]["text"]
+    assert not list((tmp_path / "job" / "extracted" / "images").glob("*.png"))

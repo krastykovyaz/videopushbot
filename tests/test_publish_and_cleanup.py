@@ -226,3 +226,24 @@ def test_djvu_with_only_page_images_is_rejected(tmp_path, monkeypatch):
     with pytest.raises(djvu.DjvuError, match="текстового слоя"):
         djvu.djvu_to_pdf(tmp_path / "a.djvu", tmp_path / "a.pdf")
     assert not (tmp_path / "a.pdf").exists()
+
+
+# ── arxiv catch-up: stale posts are ignored ───────────────────────────────────
+def _channel_event(bot_mod, age_hours):
+    from datetime import datetime, timedelta, timezone
+    from telethon.tl import types
+    text = "Title https://arxiv.org/abs/2610.00001 pdf"
+    msg = types.Message(id=7, peer_id=types.PeerChannel(1), date=datetime.now(timezone.utc) - timedelta(hours=age_hours),
+                        message=text, entities=[
+                            types.MessageEntityTextUrl(offset=0, length=5, url="https://arxiv.org/abs/2610.00001"),
+                            types.MessageEntityTextUrl(offset=39, length=3, url="https://arxiv.org/pdf/2610.00001v1")])
+    return type("Ev", (), {"message": msg})()
+
+
+def test_old_channel_posts_replayed_after_downtime_are_skipped(bot_mod, monkeypatch):
+    reached = []
+    monkeypatch.setattr(bot_mod, "is_suitable_pdf_url", lambda url: reached.append(url) or (False, "test"))
+    asyncio.run(bot_mod._process_arxiv_channel_post(_channel_event(bot_mod, age_hours=96), "arxivpaper", ["en"]))
+    assert reached == []                                             # too old: not even looked at
+    asyncio.run(bot_mod._process_arxiv_channel_post(_channel_event(bot_mod, age_hours=2), "arxivpaper", ["en"]))
+    assert reached == ["https://arxiv.org/pdf/2610.00001v1"]        # fresh: goes through the normal checks

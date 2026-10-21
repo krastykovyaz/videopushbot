@@ -154,15 +154,24 @@ class YouTubeUploader:
             logging.error(f"❌ YouTube: {e}")
             return {'success': False, 'error': str(e)}
 
-    def _upload_thumbnail(self, video_id, thumbnail_path):
-        try:
-            self.youtube.thumbnails().set(
-                videoId=video_id,
-                media_body=MediaFileUpload(thumbnail_path)
-            ).execute()
-            logging.info("✅ YouTube thumbnail uploaded")
-        except Exception as e:
-            logging.error(f"❌ YouTube thumbnail: {e}")
+    def _upload_thumbnail(self, video_id, thumbnail_path, retry_delay=20):
+        # Right after an upload YouTube sometimes answers 403 "can't be set for
+        # the specified video" while it is still registering the video; one
+        # retry a little later takes care of that.
+        for attempt in (1, 2):
+            try:
+                self.youtube.thumbnails().set(
+                    videoId=video_id,
+                    media_body=MediaFileUpload(thumbnail_path)
+                ).execute()
+                logging.info("✅ YouTube thumbnail uploaded")
+                return
+            except Exception as e:
+                if attempt == 1:
+                    logging.warning(f"YouTube thumbnail: {str(e)[:120]} — retry in {retry_delay} s")
+                    time.sleep(retry_delay)
+                else:
+                    logging.error(f"❌ YouTube thumbnail: {e}")
 
     def _add_to_playlist(self, video_id, playlist_id):
         try:

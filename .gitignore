@@ -37,6 +37,7 @@ processed_*.json
 daily_publish_count.json
 deferred_publishes.json
 checker_last_run.json
+handled_messages.json
 processed_videos/
 *.tmp
 

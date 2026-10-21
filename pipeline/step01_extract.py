@@ -18,8 +18,9 @@ MIN_VISUALS = 3              # below this many figures, text pages are added as 
 _CAPTION_KEYWORDS = ("figure", "fig.", "fig ", "table", "рис.", "рисунок", "таблица")
 
 
-def extract_pdf(pdf_path: Path, job_dir: Path) -> list[dict]:
+def extract_pdf(pdf_path: Path, job_dir: Path, with_images: bool = True) -> list[dict]:
     """
+    with_images=False: только текст (для классификации темы), картинки не рендерятся.
     Возвращает список блоков:
     {
       "page": int,
@@ -49,6 +50,9 @@ def extract_pdf(pdf_path: Path, job_dir: Path) -> list[dict]:
             if b[6] == 0 and b[4].strip()  # type 0 = text
         ]
         full_text = "\n".join(b["text"] for b in text_blocks)
+        if not with_images:
+            pages.append({"page": page_num, "text": full_text, "images": []})
+            continue
 
         # ── Изображения ──────────────────────────────────────────────────────
         images = []
@@ -128,7 +132,7 @@ def extract_pdf(pdf_path: Path, job_dir: Path) -> list[dict]:
     # Pages without a recognisable figure are shown whole (and scrolled by the
     # video renderer) only when the paper would otherwise have almost no visuals.
     have = sum(len(p["images"]) for p in pages)
-    for page_num in page_candidates[:max(0, MIN_VISUALS - have)]:
+    for page_num in page_candidates[:max(0, MIN_VISUALS - have)] if with_images else []:
         try:
             page = doc[page_num]
             rect = _content_rect(page)
