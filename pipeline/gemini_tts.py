@@ -179,8 +179,9 @@ def split_dialogue(audio: AudioSegment, texts: list[str]) -> list[AudioSegment] 
     return [_trim(p) for p in pieces]
 
 
-def synthesize_chunk(lines: list[tuple[str, str]], lang: str) -> list[AudioSegment] | None:
-    """lines: [(speaker, text)]. Returns one AudioSegment per line, or None."""
+def synthesize_chunk(lines: list[tuple[str, str]], lang: str) -> list[AudioSegment | None] | None:
+    """lines: [(speaker, text)]. Returns one AudioSegment per line (None for a
+    line that could not be voiced), or None when no model answered at all."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for model in gemini_models.tts_models():
         if _exhausted_until.get(model) == today:
@@ -198,8 +199,18 @@ def synthesize_chunk(lines: list[tuple[str, str]], lang: str) -> list[AudioSegme
             continue
         pieces = split_dialogue(audio, [t for _, t in lines])
         if pieces is None:
-            log.warning(f"Gemini TTS {model}: couldn't cut {len(lines)} lines cleanly, using Edge for this chunk")
-            return None
+            if len(lines) == 1:
+                log.warning(f"Gemini TTS {model}: audio does not match the line, using Edge for it")
+                return None
+            # The model spoke, but the pauses between lines could not be found.
+            # Smaller requests cut reliably (a single line needs no cut at all),
+            # so the chunk is retried in halves instead of being handed to Edge.
+            half = len(lines) // 2
+            log.warning(f"Gemini TTS {model}: couldn't cut {len(lines)} lines cleanly, "
+                        f"retrying as {half} + {len(lines) - half}")
+            left = synthesize_chunk(lines[:half], lang) or [None] * half
+            right = synthesize_chunk(lines[half:], lang) or [None] * (len(lines) - half)
+            return left + right
         log.info(f"Gemini TTS OK [{lang}, {model}]: {len(lines)} lines, {len(audio) / 1000:.1f}s")
         return pieces
     return None

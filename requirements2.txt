@@ -12,7 +12,7 @@ google-api-python-client>=2.100.0
 google-auth-httplib2>=0.2.0
 
 # TTS — русский + английский: Edge TTS (Microsoft Neural, бесплатно, онлайн)
-edge-tts>=6.1.9
+edge-tts>=7.3.1              # older releases get HTTP 403 from the Edge endpoint
 # Chatterbox was an EN TTS fallback that's no longer wired into
 # pipeline/step03_tts.py's actual synthesis chain (espeak-ng CLI -> pyttsx3
 # -> Edge TTS) — dropped here since it pulled multi-GB torch/torchaudio for

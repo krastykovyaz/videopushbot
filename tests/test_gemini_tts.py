@@ -100,3 +100,31 @@ def test_generate_tts_uses_gemini_pieces_and_edge_for_the_rest(tmp_path, monkeyp
     timeline, fallback = step03_tts.generate_tts(script, tmp_path, "ru")
     assert len(timeline) == 4 and fallback == 0
     assert edge_calls == ["three", "four"]                 # only the failed chunk went to Edge
+
+
+def test_uncuttable_chunk_is_retried_in_smaller_pieces(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gemini_tts, "_call_model", lambda model, lines, lang: calls.append(len(lines)) or AudioSegment.silent(1000))
+    monkeypatch.setattr(gemini_tts, "split_dialogue",
+                        lambda audio, texts: None if len(texts) > 1 else [AudioSegment.silent(100)])
+    monkeypatch.setattr(gemini_tts, "_exhausted_until", {})
+    monkeypatch.setenv("GEMINI_TTS_MODELS", "model-a")
+    pieces = gemini_tts.synthesize_chunk([("host1", "a"), ("host2", "b"), ("host1", "c"), ("host2", "d")], "ru")
+    assert pieces and len(pieces) == 4 and all(p is not None for p in pieces)
+    assert calls == [4, 2, 1, 1, 2, 1, 1]                   # halved until every line is its own request
+
+
+def test_robot_voice_fails_the_job_and_clears_its_cache(tmp_path, monkeypatch):
+    import pytest
+    from pipeline import step03_tts
+    def robot(text, speaker, out_path, lang):
+        AudioSegment.silent(duration=300).export(str(out_path), format="wav")
+        return False                                          # Edge failed, espeak spoke
+    monkeypatch.setattr(step03_tts, "_synthesize_sync", robot)
+    monkeypatch.setattr(step03_tts.gemini_tts, "enabled_for", lambda lang: False)
+    monkeypatch.setattr(step03_tts, "ALLOW_ROBOT_VOICE", False)
+    script = {"segments": [{"speaker": "host1", "text": "one"}, {"speaker": "host2", "text": "two"}]}
+    with pytest.raises(RuntimeError, match="/retry ru"):
+        step03_tts.generate_tts(script, tmp_path, "ru")
+    assert not list((tmp_path / "audio").glob("*.wav"))      # nothing robotic left for the retry to reuse
+    assert not (tmp_path / "final_audio.mp3").exists()

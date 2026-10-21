@@ -24,6 +24,10 @@ from pipeline import gemini_tts
 log = logging.getLogger("step03")
 
 PAUSE_BETWEEN_MS = 300
+FADE_MS = 12                 # removes the click where one voice's audio meets the next
+# espeak/pyttsx3 only speak when both Gemini TTS and Edge TTS failed. That voice
+# is not fit to publish, so the job fails (and can be retried) unless allowed here.
+ALLOW_ROBOT_VOICE = os.getenv("TTS_ALLOW_ROBOT_VOICE", "0") == "1"
 
 # Edge TTS голоса для русского — Microsoft Neural, очень естественные
 EDGE_VOICES_RU = {
@@ -77,6 +81,7 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
     combined = AudioSegment.empty()
     current_ms = 0
     fallback_count = 0
+    robot_paths = []
 
     if gemini_tts.enabled_for(lang):
         _prefill_with_gemini(segments, audio_dir, lang)
@@ -93,6 +98,7 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
             log.info(f"TTS [{lang}/{speaker}] сег {i+1}/{len(segments)}: {text[:60]}...")
             if not _synthesize_sync(text, speaker, wav_path, lang):
                 fallback_count += 1
+                robot_paths.append(wav_path)
         else:
             log.info(f"Кэш: сегмент {i+1}")
 
@@ -104,6 +110,7 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
             wav_path.unlink(missing_ok=True)
             if not _synthesize_sync(text, speaker, wav_path, lang):
                 fallback_count += 1
+                robot_paths.append(wav_path)
             seg_audio = AudioSegment.from_wav(str(wav_path))
         duration_ms = len(seg_audio)
 
@@ -122,9 +129,18 @@ def generate_tts(script: dict, job_dir: Path, lang: str = "ru") -> list[dict]:
 
         # Нормализовать громкость сегмента перед склейкой
         seg_audio = seg_audio.normalize()
+        if len(seg_audio) > 4 * FADE_MS:
+            seg_audio = seg_audio.fade_in(FADE_MS).fade_out(FADE_MS)
         combined += seg_audio
         combined += AudioSegment.silent(duration=PAUSE_BETWEEN_MS)
         current_ms += duration_ms + PAUSE_BETWEEN_MS
+
+    if robot_paths and not ALLOW_ROBOT_VOICE:
+        for p in robot_paths:            # never serve a robot line from the cache on /retry
+            p.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"{len(robot_paths)}/{len(timeline)} сегментов получились роботизированным голосом "
+            f"(Gemini TTS и Edge TTS недоступны) — видео не собрано, повтори позже: /retry {lang}")
 
     final_mp3 = job_dir / "final_audio.mp3"
     combined.export(
@@ -177,6 +193,8 @@ def _prefill_with_gemini(segments: list[dict], audio_dir: Path, lang: str):
         if not pieces:
             continue
         for (i, speaker, text), piece in zip(items, pieces):
+            if piece is None:
+                continue
             path = _segment_wav_path(audio_dir, i, speaker, text, lang)
             tmp = path.with_name(path.name + ".tmp")
             piece.export(str(tmp), format="wav")
