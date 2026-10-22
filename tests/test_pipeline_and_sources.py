@@ -164,3 +164,12 @@ def test_captions_are_unescaped_and_tidied():
     assert _clean_caption("Рынок&amp;nbsp;новых  автомобилей\n") == "Рынок новых автомобилей"   # double-escaped
     assert _clean_caption("A B &quot;x&quot;") == 'A B "x"'
     assert _clean_caption(None) == ""
+
+
+def test_automotive_videos_link_their_own_telegram_channel():
+    from common.gemini_client import append_footer
+    auto = append_footer("текст", "ru", "Auto Detail")
+    assert "https://t.me/autoanalitic" in auto and "arxivpaper" not in auto
+    assert "https://t.me/arxivpaper" in append_footer("текст", "ru", "AI Paper Review")
+    assert "https://t.me/arxivpaper" in append_footer("текст", "ru")            # no category: unchanged
+    assert "https://t.me/arxivpaper" in append_footer("text", "en", "Auto Detail")   # EN never carries auto content

@@ -97,7 +97,7 @@ async def process_url(index: int, url: str, workspace: Path,
 
         title, key_points = load_script_title_and_points(lang_dir)
         gemini = gemini_ru if lang == "ru" else gemini_en
-        description = gemini.generate_description(title, key_points, lang=lang)
+        description = gemini.generate_description(title, key_points, lang=lang, category=category)
         description += f"\n\nSource: {url}"
 
         if lang == "ru":
