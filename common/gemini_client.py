@@ -47,11 +47,15 @@ _FALLBACK_DESCRIPTION = {
     "en": "Overview: {title}",
 }
 
-_RU_FOOTER = (
+# Automotive videos promote their own Telegram channel instead of the papers one.
+AUTOMOTIVE_CATEGORY = "Auto Detail"
+_RU_FOOTER_TEMPLATE = (
     "\n\nПоддержка: https://boosty.to/krastykovyaz\n"
-    "Подписывайся - https://t.me/arxivpaper\n"
+    "Подписывайся - https://t.me/{channel}\n"
     "создано с помощью NotebookLM"
 )
+_RU_FOOTER = _RU_FOOTER_TEMPLATE.format(channel="arxivpaper")
+_RU_AUTO_FOOTER = _RU_FOOTER_TEMPLATE.format(channel="autoanalitic")
 
 _EN_FOOTER = (
     "\n\nDonats: https://www.patreon.com/c/luxak\n\n"
@@ -71,12 +75,12 @@ Pick exactly ONE category from this list that best fits the document:
 Return ONLY the category name, exactly as written above, with no extra text.
 """
 
-def append_footer(description: str, lang: str) -> str:
+def append_footer(description: str, lang: str, category: str | None = None) -> str:
     """Shared by Gemini-generated descriptions and channel-sourced ones (see
     bot.py's arxiv channel listeners), so the support/subscribe footer is
     consistent regardless of where the description text came from."""
     if lang == "ru":
-        return description + _RU_FOOTER
+        return description + (_RU_AUTO_FOOTER if category == AUTOMOTIVE_CATEGORY else _RU_FOOTER)
     elif lang == "en":
         return description + _EN_FOOTER
     return description
@@ -97,7 +101,7 @@ class GeminiContentGenerator:
             prompt, api_key=self.api_key, preferred=self.preferred_model,
             timeout=self.REQUEST_TIMEOUT_SECONDS).text
 
-    def generate_description(self, title, content, lang="ru"):
+    def generate_description(self, title, content, lang="ru", category=None):
         if len(content) > 5000:
             content = content[:5000] + "..."
 
@@ -110,7 +114,7 @@ class GeminiContentGenerator:
             logging.error(f"❌ Gemini error (all models failed): {e}")
             description = _FALLBACK_DESCRIPTION.get(lang, _FALLBACK_DESCRIPTION["en"]).format(title=title)
 
-        return append_footer(description, lang)
+        return append_footer(description, lang, category)
 
     def classify_topic(self, title, content, categories):
         if len(content) > 3000:

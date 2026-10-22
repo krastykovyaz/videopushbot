@@ -1032,10 +1032,10 @@ async def _publish(chat_id: int, user_id: int, base_job_id: str, lang: str, cate
         title, key_points = load_script_title_and_points(video_path.parent)
         channel_desc = job_channel_description.get(base_job_id)
         if channel_desc:
-            entry["description"] = append_footer(channel_desc, lang)
+            entry["description"] = append_footer(channel_desc, lang, category)
         else:
             gemini = gemini_ru if lang == "ru" else gemini_en
-            entry["description"] = await asyncio.to_thread(gemini.generate_description, title, key_points, lang=lang)
+            entry["description"] = await asyncio.to_thread(gemini.generate_description, title, key_points, lang=lang, category=category)
         entry["title"] = title
     title, description = entry["title"], entry["description"]
 
