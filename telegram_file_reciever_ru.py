@@ -234,6 +234,25 @@ app = Client(
 user_states = {}
 
 # =============================================================================
+# Ограничение доступа только к одному чату
+# =============================================================================
+
+ALLOWED_CHAT_USER_ID = 8591956842
+ALLOWED_CHAT_FILTER = filters.private & filters.user(ALLOWED_CHAT_USER_ID)
+
+
+def is_allowed_chat(message: Message) -> bool:
+    """Проверка, что сообщение пришло из приватного чата с нужным пользователем."""
+    chat = getattr(message, 'chat', None)
+    if chat is None:
+        return False
+
+    if getattr(chat, 'type', None) != 'private':
+        return False
+
+    return int(chat.id) == ALLOWED_CHAT_USER_ID and int(message.from_user.id) == ALLOWED_CHAT_USER_ID
+
+# =============================================================================
 # УТИЛИТЫ
 # =============================================================================
 
@@ -296,8 +315,11 @@ def read_document(file_path):
 # КОМАНДЫ
 # =============================================================================
 
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & ALLOWED_CHAT_FILTER)
 async def start_command(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     user_id = message.from_user.id
     
     if not is_allowed_user(user_id):
@@ -315,8 +337,11 @@ async def start_command(client, message: Message):
         "/stats - Статистика"
     )
 
-@app.on_message(filters.command("help"))
+@app.on_message(filters.command("help") & ALLOWED_CHAT_FILTER)
 async def help_command(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     await message.reply_text(
         "📖 **Инструкция:**\n\n"
         "**Видео (.mp4, .mov, .avi, .mkv, .webm):**\n"
@@ -332,8 +357,11 @@ async def help_command(client, message: Message):
         f"**Ваш ID:** `{message.from_user.id}`"
     )
 
-@app.on_message(filters.command("stats"))
+@app.on_message(filters.command("stats") & ALLOWED_CHAT_FILTER)
 async def stats_command(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     folder = CONFIG['download_folder']
     
     if not os.path.exists(folder):
@@ -353,8 +381,11 @@ async def stats_command(client, message: Message):
 # =============================================================================
 # ОБРАБОТЧИК ВИДЕО
 # =============================================================================
-@app.on_message(filters.video)
+@app.on_message(filters.video & ALLOWED_CHAT_FILTER)
 async def handle_video(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     user_id = message.from_user.id
     
     if not is_allowed_user(user_id):
@@ -530,8 +561,11 @@ async def upload_to_youtube_from_telegram(video_path, video_name, message, statu
 # ОБРАБОТЧИК ДОКУМЕНТОВ (PDF/TXT) - С ГЕНЕРАЦИЕЙ METADATA
 # =============================================================================
 
-@app.on_message(filters.document)
+@app.on_message(filters.document & ALLOWED_CHAT_FILTER)
 async def handle_document(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
     
@@ -628,8 +662,11 @@ async def handle_document(client, message: Message):
 # ОБРАБОТЧИК ТЕКСТА И ИЗОБРАЖЕНИЙ - ПОСЛЕДОВАТЕЛЬНЫЙ ДИАЛОГ
 # =============================================================================
 
-@app.on_message(filters.text & ~filters.command(["start", "help", "stats"]))
+@app.on_message((filters.text & ~filters.command(["start", "help", "stats"])) & ALLOWED_CHAT_FILTER)
 async def handle_text(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     user_id = message.from_user.id
     
     if not is_allowed_user(user_id):
@@ -708,8 +745,11 @@ async def handle_text(client, message: Message):
 # ОБРАБОТЧИК ИЗОБРАЖЕНИЙ (ШАГ 3: THUMBNAIL)
 # =============================================================================
 
-@app.on_message(filters.photo)
+@app.on_message(filters.photo & ALLOWED_CHAT_FILTER)
 async def handle_photo(client, message: Message):
+    if not is_allowed_chat(message):
+        return
+
     user_id = message.from_user.id
     
     if not is_allowed_user(user_id):
